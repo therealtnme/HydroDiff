@@ -480,6 +480,19 @@ seeds (40.69 / 39.53 against 41.04 / 39.94) for 16% less compute, and the noise 
 (39.96 at compute 0.71) is within noise of the best dense result of any model (nohetero, 39.63 / 38.78) for 29% less
 compute. `hetero_prob=0.25` is the default from here on.
 
+The default sampler on this model (FID, 2,000 samples; speed alone on the sub-agent's 4-thread CPU, batches of 250):
+
+| DPM-Solver | FID | Compute | ms / image |
+| --- | --- | --- | --- |
+| dense, 12 steps | 39.96 | 1.00 | 39 |
+| dense, 16 steps | 40.34 / 39.45 | 1.00 | 54 |
+| **noise mask, 16 steps (default)** | **39.87 / 38.91** | **0.89** | **47** |
+| dense, 32 steps | 41.61 | 1.00 | - |
+
+On the default model the default sampler is 0.47 and 0.54 FID better than the dense sampler on the two seeds and 13%
+faster - a small but consistent gain. Dense DPM-Solver with 12 steps is as good and faster still, so the conclusion of
+section 10 stands: on this bench the step count is the bigger lever.
+
 ## Prior work
 
 The three ideas each have close relatives in recent work. The review (2022-2026) shaped the design:

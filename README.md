@@ -12,7 +12,7 @@ Every idea was measured on CIFAR-10 (32x32, class-conditional) with the 3M-param
 
 | Idea | What was measured | Status |
 | ---- | ----------------- | ------ |
-| Non-binary noise mask (per-token noise level) | The uncertainty head finds unpredictable detail (Spearman 0.53-0.67 against high-frequency energy). It keeps the dense sampler's quality for 11% less compute at 16 steps and 16% less at 32 steps. On briefly trained models it was up to 2.3 FID *better* than the dense sampler; on longer-trained models it is level. It needs mixed-level training and enough steps per token. | Default |
+| Non-binary noise mask (per-token noise level) | The uncertainty head finds unpredictable detail (Spearman 0.53-0.67 against high-frequency energy). It is level with or slightly better than the dense sampler for 11% less compute at 16 steps and 16% less at 32 steps (final model: 0.5 FID better on both seeds at 16 steps). On briefly trained models it was up to 2.3 FID better. It needs mixed-level training and enough steps per token. | Default |
 | Binary update mask (only active tokens are computed) | Finished tokens are skipped exactly; the key/value cache costs no measurable quality. With `reuse`, 32-step sampling uses 29-36% less compute at the same quality with DPM-Solver (39-43% less wall-clock time); with Euler on longer-trained models it costs 0.5-2 FID. Choosing the skipped tokens at random works about as well as choosing the surest. | Default (finished tokens); `reuse` is an option |
 | Mixture-of-experts denoiser | No accuracy or speed gain at equal active compute at this scale; per-token routing makes single-image latency 57% worse. | Option, off by default |
 | Per-token fresh noise (`churn`) | No gain; worse when strong. | Dropped (default `0`) |
@@ -22,19 +22,19 @@ Every idea was measured on CIFAR-10 (32x32, class-conditional) with the 3M-param
 
 ### Final model
 
-`hydrodiff-s` trained for 12,000 steps (92 minutes on 4 CPU threads) with the default configuration except `hetero_prob=0.5` (the default before a confirmation run showed 0.25 to be 0.6-1.4 FID better in every setting; see [`test/RESEARCH.md`](test/RESEARCH.md), section 11). Sampling speed was measured alone on the machine (4 threads, batches of 250).
+`hydrodiff-s` with the default configuration, trained for 12,000 steps (DPM-Solver; FID with 2,000 samples on two sampling seeds; speed measured alone on a 4-thread CPU, batches of 250):
 
-| Sampler (DPM-Solver) | FID (2,000 samples, 2 seeds) | Compute | ms / image |
-| -------------------- | ---------------------------- | ------- | ---------- |
-| dense, 16 steps | 41.59 / 40.39 | 1.00 | 42 |
-| **noise mask, 16 steps (default `generate()`)** | **41.45 / 40.04** | **0.89** | **34** |
-| dense, 32 steps | 42.66 | 1.00 | 82 |
-| noise mask + `reuse=0.25`, 32 steps | 41.34 | 0.71 | 50 |
-| dense, 12 steps | 41.72 | 1.00 | 33 |
+| Sampler (DPM-Solver) | FID | Compute | ms / image |
+| -------------------- | --- | ------- | ---------- |
+| dense, 16 steps | 40.34 / 39.45 | 1.00 | 54 |
+| **noise mask, 16 steps (default `generate()`)** | **39.87 / 38.91** | **0.89** | **47** |
+| dense, 12 steps | 39.96 | 1.00 | 39 |
+| dense, 32 steps | 41.61 | 1.00 | - |
+| noise mask + `reuse=0.25`, 32 steps | 39.96 | 0.71 | - |
 
-With 5,000 samples and Euler at 32 steps, the noise mask gives FID 33.52 against 33.43 for the dense sampler, for 84% of the compute.
+The default sampler is 0.5 FID better than the dense sampler on both seeds and 13% faster. With Euler at 32 steps the noise mask gives 40.69 / 39.53 against 41.04 / 39.94 for 84% of the compute. An earlier final model (`hetero_prob=0.5`) was also checked with 5,000 samples: noise mask 33.52 against dense 33.43 (Euler, 32 steps, 84% of the compute).
 
-![100 samples from the final model, one class per column](test/figures/samples.png)
+![100 samples from the earlier final model, one class per column](test/figures/samples.png)
 
 Two limits matter for the speed claims:
 
