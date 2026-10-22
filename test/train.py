@@ -84,6 +84,7 @@ def main():
     ap.add_argument("--weight-decay", type=float, default=0.0)
     ap.add_argument("--warmup", type=int, default=200)
     ap.add_argument("--ema", type=float, default=0.999)
+    ap.add_argument("--extra-ema", type=float, nargs="*", default=[], help="more EMA decays, saved as ema_<decay>")
     ap.add_argument("--eval-every", type=int, default=500)
     ap.add_argument("--save-every", type=int, default=250, help="full training state for resuming after an interruption")
     ap.add_argument("--threads", type=int, default=1)
@@ -104,6 +105,7 @@ def main():
         model = HydroDiffForImageGeneration(HydroDiffConfig.from_preset(args.preset, **overrides))
     model.train()
     ema = copy.deepcopy(model).eval().requires_grad_(False)
+    emas = {args.ema: ema, **{d: copy.deepcopy(ema) for d in args.extra_ema}}
     images, labels = load_images(args.data)
     val_images, val_labels = load_images(args.val_data)
     val_images, val_labels = val_images[: args.val_size], val_labels[: args.val_size]
@@ -124,6 +126,9 @@ def main():
         state = torch.load(state_path, weights_only=False)
         model.load_state_dict(state["model"])
         ema.load_state_dict(state["ema"])
+        for d, extra in state.get("extra_ema", {}).items():
+            if d in emas:
+                emas[d].load_state_dict(extra)
         for opt, opt_state in zip(optimizers, state["optimizers"]):
             opt.load_state_dict(opt_state)
         step = state["step"]
@@ -153,11 +158,12 @@ def main():
             opt.step()
             opt.zero_grad(set_to_none=True)
         with torch.no_grad():
-            decay = min(args.ema, (1 + step) / (10 + step))
-            for pe, pm in zip(ema.parameters(), model.parameters()):
-                pe.lerp_(pm, 1 - decay)
-            for be, bm in zip(ema.buffers(), model.buffers()):
-                be.copy_(bm)
+            for target, average in emas.items():
+                decay = min(target, (1 + step) / (10 + step))
+                for pe, pm in zip(average.parameters(), model.parameters()):
+                    pe.lerp_(pm, 1 - decay)
+                for be, bm in zip(average.buffers(), model.buffers()):
+                    be.copy_(bm)
         seen_loss.append(out.denoise_loss.item())
         step += 1
         if step % args.eval_every == 0:
@@ -168,9 +174,10 @@ def main():
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n")
             log.flush()
-            ema.save_pretrained(os.path.join(args.out, "ema"))
+            save_emas(emas, ema, args.out)
         if step % args.save_every == 0:
             state = dict(model=model.state_dict(), ema=ema.state_dict(), optimizers=[o.state_dict() for o in optimizers],
+                         extra_ema={d: e.state_dict() for d, e in emas.items() if e is not ema},
                          step=step, generator=g.get_state(), torch_rng=torch.get_rng_state(), elapsed=time.time() - start)
             torch.save(state, state_path + ".tmp")
             os.replace(state_path + ".tmp", state_path)
@@ -179,7 +186,12 @@ def main():
                params=params, imgs_per_sec=step * args.batch / (time.time() - start))
     print(json.dumps(rec), flush=True)
     log.write(json.dumps(rec) + "\n")
-    ema.save_pretrained(os.path.join(args.out, "ema"))
+    save_emas(emas, ema, args.out)
+
+
+def save_emas(emas, ema, out):
+    for decay, average in emas.items():
+        average.save_pretrained(os.path.join(out, "ema" if average is ema else f"ema_{decay}"))
 
 
 if __name__ == "__main__":
