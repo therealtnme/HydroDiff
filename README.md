@@ -22,7 +22,7 @@ Every idea was measured on CIFAR-10 (32x32, class-conditional) with the 3M-param
 
 ### Final model
 
-`hydrodiff-s` with the default configuration, trained for 12,000 steps (92 minutes on 4 CPU threads). Sampling speed was measured alone on the machine (4 threads, batches of 250).
+`hydrodiff-s` trained for 12,000 steps (92 minutes on 4 CPU threads) with the default configuration except `hetero_prob=0.5` (the default before a confirmation run showed 0.25 to be 0.6-1.4 FID better in every setting; see [`test/RESEARCH.md`](test/RESEARCH.md), section 11). Sampling speed was measured alone on the machine (4 threads, batches of 250).
 
 | Sampler (DPM-Solver) | FID (2,000 samples, 2 seeds) | Compute | ms / image |
 | -------------------- | ---------------------------- | ------- | ---------- |
