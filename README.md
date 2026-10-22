@@ -189,12 +189,19 @@ can be loaded through the standard Auto API.
 ## Training
 
 ```bash
-python test/prepare_cifar10.py <CIFAR-10 image folders> /home/user/data
+bash test/setup_bench.sh                       # packages, CIFAR-10 as .npz, InceptionV3 weights for FID
 python test/train.py --preset hydrodiff-s --steps 4000 --out runs/base
-python test/evaluate.py --ckpt runs/base/ema --n 5000 --gen steps=32
+python test/validate.py runs/base/ema
+python test/evaluate.py --ckpt runs/base/ema --n 2000 --gen steps=32
+python test/evaluate.py --ckpt runs/base/ema --n 2000 --gen steps=32 reuse=0.5
 ```
 
-`--set key=value` overrides any configuration field. `test/evaluate.py` reports FID (InceptionV3), the sampling time per image and the compute of the sampler.
+* `--set key=value` overrides any configuration field.
+* Training saves its full state every 250 steps; running the same command again continues where it stopped.
+* `test/validate.py` measures every checkpoint on the same fixed images, noise and noise levels.
+* `test/evaluate.py` reports FID (InceptionV3), the sampling time per image and the compute of the sampler; `test/sampler_study.py` runs a list of sampler settings in parallel.
+* `test/mask_analysis.py` measures what the noise mask finds and draws the figure above.
+* `python -m pytest test/test_hydrodiff.py` runs the unit tests.
 
 ## Example
 
@@ -219,9 +226,15 @@ HydroDiff/
 │   └── optimization_hydrodiff.py
 ├── test/
 │   ├── RESEARCH.md
+│   ├── figures/
+│   ├── setup_bench.sh
 │   ├── prepare_cifar10.py
 │   ├── train.py
-│   └── evaluate.py
+│   ├── validate.py
+│   ├── evaluate.py
+│   ├── sampler_study.py
+│   ├── mask_analysis.py
+│   └── test_hydrodiff.py
 ├── example_generate.py
 ├── LICENSE
 └── README.md

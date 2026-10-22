@@ -61,6 +61,7 @@ def make_model():
 
 def sample(model, seed: int = 0, labels: torch.Tensor = LABELS, **kwargs):
     kwargs.setdefault("steps", STEPS)
+    kwargs.setdefault("min_token_steps", 0)  # 8 steps are too few for the guard to allow any speed-up
     return model.generate(labels=labels, generator=torch.Generator().manual_seed(seed), **kwargs)
 
 
@@ -406,3 +407,15 @@ def test_perfect_x_prediction_has_zero_loss_at_every_t(make_model):
     )()
     out = model(pixels, torch.tensor([0, 1]), timesteps=timesteps)
     assert out.denoise_loss.abs() < 1e-10
+
+
+def test_min_token_steps_caps_the_speed_up(make_model):
+    """No token may take fewer steps than `min_token_steps`; with too few steps the noise mask is the dense sampler."""
+    model = make_model()
+    guarded = sample(model, steps=12, min_token_steps=12, return_masks=True)
+    dense = sample(model, steps=12, adaptive=False)
+    assert guarded.compute == 1.0
+    torch.testing.assert_close(guarded.images, dense.images)
+    out = sample(model, steps=24, min_token_steps=16, return_masks=True)
+    taken = (out.noise_masks[:-1] > 0).sum(0)  # steps each token spent with noise left
+    assert taken.min() >= 16 and out.compute < 1.0

@@ -283,6 +283,48 @@ Same training as `base` (`hetero_prob=0.5`, `hetero_start=0`), one change each. 
 
 x-prediction stays the default (it is the safer choice for larger patches), and long skips stay an option.
 
+## 9. Longer training (12,000 steps)
+
+A remote sub-agent trained `base` (`hetero_prob=0.5`, `hetero_start=0`) for 12,000 steps (4 threads, 83 minutes) and
+repeated the sampler study (FID, 2,000 samples; seed noise about 1):
+
+| Validation | v_uniform | v_mixed | x0_mse t<0.1 | t 0.1-0.3 | t 0.3-0.6 | t 0.6-1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| base, 4,000 steps | 0.1385 | 0.1314 | 0.00077 | 0.00577 | 0.02117 | 0.11307 |
+| base, 12,000 steps | 0.1330 | 0.1242 | 0.00071 | 0.00557 | 0.02058 | 0.10906 |
+
+| Sampler (12,000-step base) | 8 steps | 12 steps | 16 steps | 20 steps | 32 steps | compute at 32 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Euler, dense | 46.51 | 43.59 | 42.50 / 41.68 | - | 41.76 | 1.00 |
+| Euler, noise mask | 50.54 | 46.16 | 44.09 | 42.89 | 41.60 | 0.84 |
+| DPM-Solver, dense | 43.84 | - | 41.53 | - | 42.22 / 41.28 | 1.00 |
+| DPM-Solver, noise mask | - | - | 41.30 | 41.14 | 41.98 | 0.84 |
+| DPM-Solver, noise mask, `max_rate=3` | - | - | - | - | 41.10 | 0.74 |
+| DPM-Solver, noise mask + `reuse=0.25` | - | - | - | - | **40.89** | **0.71** |
+| DPM-Solver, `reuse=0.25` | - | - | - | - | 40.95 | 0.82 |
+| DPM-Solver, noise mask + `reuse=0.5` | - | - | - | - | 42.88 | 0.60 |
+
+| Other settings (DPM-Solver, 32 steps, noise mask) | FID | compute |
+| --- | --- | --- |
+| default (`warmup=0.25`, refresh on, cache on) | 41.98 | 0.84 |
+| every token computed every step (`skip_finished=False`) | 41.93 | 1.00 |
+| no `t = 0` refresh | 42.12 | 0.81 |
+| `warmup=0.1` / `warmup=0.5` | 42.07 / 42.24 | 0.81 / 0.91 |
+| Euler, `churn=0.2` / `churn=0.5` | 41.69 / 44.58 | 0.84 |
+
+With three times the training, the picture changes in three ways:
+
+* **At 32 steps the masks still save compute at equal quality:** 16% (noise mask), 26% (`max_rate=3`) and 29%
+  (noise mask + `reuse=0.25`), all within noise of the dense sampler or better. `reuse=0.5` now costs about 1 FID.
+* **The noise mask no longer improves accuracy, and at 16-20 Euler steps it costs quality** (44.09 against 42.50 /
+  41.68 at 16 steps). A token that runs twice as fast in a 16-step run is denoised on an 8-step grid, and a better
+  trained model is more sensitive to that than to the context it gains. With DPM-Solver the coarse grid does less harm
+  (41.30 at 16 steps).
+* **DPM-Solver catches up with Euler** (16 steps: 41.53 against 42.50 / 41.68), so the Euler advantage of section 5
+  belongs to the briefly trained model.
+
+The cache, the warmup and the refresh behave as before (no measurable effect), and `churn` again does not help.
+
 <!-- REMOTE -->
 
 ## Prior work

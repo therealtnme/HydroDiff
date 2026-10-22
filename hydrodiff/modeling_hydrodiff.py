@@ -484,6 +484,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         adaptive: bool = True,
         max_rate: float | None = None,
         warmup: float = 0.25,
+        min_token_steps: int = 16,
         solver: str = "euler",
         churn: float = 0.0,
         reuse: float = 0.0,
@@ -502,6 +503,10 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         spread between by rank (geometrically). Tokens that reach `t = 0` leave the update mask, so later steps run on
         fewer tokens, and the hardest tokens are finished last against an already clean context. With
         `adaptive=False` every token follows the same schedule.
+
+        `min_token_steps` caps the speed-up so that no token takes fewer steps than that: a fast token is denoised on a
+        coarser time grid, and below the step count at which the dense sampler stops improving that costs quality.
+        With the defaults it only binds below 32 steps (16 steps or fewer: no speed-up; 20 steps: 1.36x at most).
 
         `solver="euler"` is the first-order step; `"dpm2m"` is DPM-Solver++(2M) on the clean-patch estimates, run per
         token so that every token uses its own step sizes. `churn` > 0 replaces that share of each token's noise with
@@ -524,6 +529,10 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         b = labels.shape[0] if labels is not None else batch_size
         n = cfg.num_patches
         max_rate = cfg.max_rate if max_rate is None else max_rate
+        # A token at speed r takes k0 + (steps - k0) / r steps, k0 being the warmup steps at speed 1
+        k0 = max(1, math.ceil(warmup * steps))
+        if min_token_steps > k0:
+            max_rate = max(1.0, min(max_rate, (steps - k0) / (min_token_steps - k0)))
         x = torch.randn(b, n, cfg.patch_dim, device=device, generator=generator, dtype=self.dtype)
         progress = torch.zeros(b, n, device=device)
         log_error = torch.zeros(b, n, device=device)
