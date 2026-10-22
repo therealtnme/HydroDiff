@@ -568,8 +568,8 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
             need = moving | (just_finished if refresh_finished else torch.zeros_like(moving))
             if reuse and shaping and k < steps - 1:
                 # the surest moving tokens that were computed last step reuse that estimate instead (never twice in a
-                # row, never for the step that finishes them, and only while the token can still be run
-                # `min_token_steps` times if every later step computes it)
+                # row, never for the step that finishes them, and only while the token can still be run `reuse_floor`
+                # times if every later step computes it)
                 top = max_rate if adaptive else 1.0
                 fewest = torch.ceil((1 - progress) * steps / top - 1e-6).clamp(max=steps - k)  # steps left at top speed
                 candidate = moving & computed & (target < 1) & (evaluations + fewest - 1 >= reuse_floor)

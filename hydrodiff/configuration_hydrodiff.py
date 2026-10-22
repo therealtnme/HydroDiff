@@ -39,12 +39,14 @@ class HydroDiffConfig(PreTrainedConfig):
       `steps * tokens`.
     - Routed experts. MLPs can be fine-grained mixtures of experts with one always-on shared expert, sigmoid top-k
       routing and an auxiliary-loss-free balancing bias. The router sees the token's own noise level through the
-      modulation, so experts can specialise by noise level and by content.
+      modulation, so experts can specialise by noise level and by content. At the bench scale they did not beat dense
+      MLPs at equal active compute, so they are off by default.
 
     Args:
         image_size (`int`), num_channels (`int`), patch_size (`int`): Image and patch shape.
         num_classes (`int`): Class labels for conditioning (0 = unconditional). One extra "null" class is added for
             classifier-free guidance; `class_dropout` is the rate at which training uses it.
+        long_skips (`bool`): U-ViT long skip connections from each block in the first half to its mirror block.
         prediction_type (`str`): `"x"` (the network outputs the clean patch, the loss is on velocity) or `"v"`
             (the network outputs the velocity). Pixel patches are high-dimensional, which favours `"x"`.
         time_shift (`float`): Resolution shift of the noise schedule, `t' = s t / (1 + (s - 1) t)`.
@@ -57,13 +59,15 @@ class HydroDiffConfig(PreTrainedConfig):
         num_experts (`int`): Routed experts per MoE layer (0 = dense MLPs).
         num_experts_per_tok (`int`), moe_intermediate_size (`int`), first_dense_layers (`int`),
         router_bias_update_rate (`float`): MoE shape and balancing-bias step.
+        moe_routing (`str`): `"token"` (each token picks its experts), `"image"` (the whole image picks, per layer and
+            step) or `"time"` (no router: each token goes to the expert of its own noise level).
 
     Example:
 
     ```python
     >>> from hydrodiff import HydroDiffConfig, HydroDiffForImageGeneration
     >>> model = HydroDiffForImageGeneration(HydroDiffConfig.from_preset("hydrodiff-s"))
-    >>> images = model.generate(labels=torch.arange(10), steps=32)
+    >>> images = model.generate(labels=torch.arange(10)).images
     ```"""
 
     model_type = "hydrodiff"
