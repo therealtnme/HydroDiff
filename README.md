@@ -57,7 +57,7 @@ speed = max_rate ** (1 - rank)
 
 Unpredictable texture is therefore generated **after** the structure around it is known, which is the accuracy argument of the noise mask.
 
-The uncertainty head does find that texture: its predicted error ranks against the high-frequency energy of the clean patch with a Spearman correlation of 0.67 at `t = 0.3` and 0.57 at `t = 0.6`, before the detail is visible. In generated images, sky and flat backgrounds finish first and objects and texture finish last:
+The uncertainty head does find that texture: its predicted error ranks against the high-frequency energy of the clean patch with a Spearman correlation of 0.57-0.67 at `t = 0.3` and 0.53-0.57 at `t = 0.6`, before the detail is visible. In generated images, sky and flat backgrounds finish first and objects and texture finish last:
 
 ![Generated images (top) and the step at which each token finished (bottom: dark = first, bright = last)](test/figures/noise_mask.png)
 

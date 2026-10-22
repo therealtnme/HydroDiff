@@ -507,6 +507,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         `min_token_steps` caps the speed-up so that no token takes fewer steps than that: a fast token is denoised on a
         coarser time grid, and below the step count at which the dense sampler stops improving that costs quality.
         With the defaults it only binds below 32 steps (16 steps or fewer: no speed-up; 20 steps: 1.36x at most).
+        `reuse` obeys the same floor: a token only skips a step while it can still be run `min_token_steps` times.
 
         `solver="euler"` is the first-order step; `"dpm2m"` is DPM-Solver++(2M) on the clean-patch estimates, run per
         token so that every token uses its own step sizes. `churn` > 0 replaces that share of each token's noise with
@@ -539,6 +540,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         x0 = torch.zeros_like(x)  # each token's latest clean-patch estimate
         prev_x0, prev_h = torch.zeros_like(x), torch.full((b, n), float("nan"), device=device)
         computed = torch.ones(b, n, dtype=torch.bool, device=device)
+        evaluations = torch.zeros(b, n, device=device)  # steps in which each token was run while it still had noise
         just_finished = torch.zeros(b, n, dtype=torch.bool, device=device)
         cache = HydroDiffTokenCache()
         to_t = lambda q: shift_time(1 - q, cfg.time_shift)
@@ -558,8 +560,11 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
             need = moving | (just_finished if refresh_finished else torch.zeros_like(moving))
             if reuse and shaping and k < steps - 1:
                 # the surest moving tokens that were computed last step reuse that estimate instead (never twice in a
-                # row, and never for the step that finishes them)
-                candidate = moving & computed & (target < 1)
+                # row, never for the step that finishes them, and only while the token can still be run
+                # `min_token_steps` times if every later step computes it)
+                top = max_rate if adaptive else 1.0
+                fewest = torch.ceil((1 - progress) * steps / top - 1e-6).clamp(max=steps - k)  # steps left at top speed
+                candidate = moving & computed & (target < 1) & (evaluations + fewest - 1 >= min_token_steps)
                 skips = (reuse * moving.sum(-1, keepdim=True)).floor()
                 score = rank if reuse_by == "uncertainty" else torch.rand(b, n, device=device, generator=generator)
                 order = torch.where(candidate, score, score + 2).argsort(-1).argsort(-1)
@@ -575,6 +580,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
             x0 = scatter_tokens(x0, index, x_a - t_a[..., None].to(x.dtype) * v)
             log_error = scatter_tokens(log_error, index, err.float())
             computed = scatter_tokens(torch.zeros_like(need), index, torch.ones_like(t_a, dtype=torch.bool))
+            evaluations += (computed & moving).float()
             evaluated += b * (n if index is None else count)
 
             # every moving token steps from t to t_next with its latest estimate; finished tokens stay as they are

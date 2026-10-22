@@ -419,3 +419,13 @@ def test_min_token_steps_caps_the_speed_up(make_model):
     out = sample(model, steps=24, min_token_steps=16, return_masks=True)
     taken = (out.noise_masks[:-1] > 0).sum(0)  # steps each token spent with noise left
     assert taken.min() >= 16 and out.compute < 1.0
+
+
+def test_reuse_keeps_min_token_steps_evaluations(make_model):
+    """`reuse` never leaves a token with fewer than `min_token_steps` evaluations, even on top of the noise mask."""
+    model = make_model()
+    out = sample(model, steps=24, min_token_steps=16, reuse=0.5, return_masks=True)
+    evaluations = out.update_masks.sum(0)  # steps in which each token was run while it still had noise
+    assert evaluations.min() >= 16
+    unguarded = sample(model, steps=24, min_token_steps=0, max_rate=2.0, reuse=0.5, return_masks=True)
+    assert unguarded.update_masks.sum(0).min() < 16 and out.compute > unguarded.compute

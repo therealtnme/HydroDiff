@@ -50,17 +50,17 @@ cleaner neighbours help. It is 2.3% worse at high noise, and high noise decides 
 `test/mask_analysis.py` ranks each token's predicted error against the detail of its clean patch (500 test images,
 Spearman correlation per image, averaged):
 
-| Noise level | vs high-pass energy | vs pixel standard deviation |
-| --- | --- | --- |
-| t = 0.3 | 0.67 | 0.39 |
-| t = 0.6 | 0.57 | 0.33 |
-| t = 0.9 | 0.25 | 0.12 |
+| Noise level | vs high-pass energy (base, 4k steps) | vs pixel std (base, 4k) | vs high-pass energy (final, 12k) | vs pixel std (final, 12k) |
+| --- | --- | --- | --- | --- |
+| t = 0.3 | 0.67 | 0.39 | 0.57 | 0.32 |
+| t = 0.6 | 0.57 | 0.33 | 0.53 | 0.30 |
+| t = 0.9 | 0.25 | 0.12 | 0.09 | 0.07 |
 
 The head finds the fine, unpredictable detail - the user's "fire, grain, dust, leaves, cracks" - not just edges or
 contrast, and it does so long before the detail is visible (t = 0.6). In generated images, flat backgrounds and sky
 finish first and objects and texture finish last:
 
-![Generated images (top) and the step at which each token finished (bottom: dark = first, bright = last)](figures/noise_mask.png)
+![Generated images (top) and the step at which each token finished (bottom: dark = first, bright = last); final model, 32 steps](figures/noise_mask.png)
 
 ### Accuracy and compute
 
@@ -281,7 +281,19 @@ Same training as `base` (`hetero_prob=0.5`, `hetero_start=0`), one change each. 
   result. Long skips cost 7% more parameters and about 7% more compute per token.
 * **`max_rate=3` in training** is no better than training with 2 and sampling with 3 (section 2).
 
-x-prediction stays the default (it is the safer choice for larger patches), and long skips stay an option.
+A second round combined them with `hetero_start=0.25` (Euler, 32 steps, compute in brackets):
+
+| Model (`hetero_start=0.25`) | x0_mse t 0.6-1 | dense | noise mask (0.84) | noise mask + `reuse=0.5` (0.59) | `reuse=0.5` (0.64) |
+| --- | --- | --- | --- | --- | --- |
+| hs25 (x-prediction, section 7) | 0.11146 | 50.80 | 49.06 | **49.61** | 50.44 |
+| long skips | 0.11144 | 48.89 | **48.87** | 51.37 | 49.92 |
+| v-prediction | **0.11098** | **48.37** | 48.95 | 51.13 | **49.26** |
+| long skips + v-prediction | 0.11212 | 49.58 | 49.44 | 51.47 | 50.31 |
+| long skips, `hetero_prob=0` | 0.11172 | 50.93 | 50.91 | 51.78 | 51.02 |
+
+With the noise mask every variant lands within noise of the others (48.9-49.4); long skips and v-prediction mainly
+lift the dense sampler. None of the combinations moves the best result, so x-prediction without long skips stays the
+default (the simplest model, and the safer choice for larger patches); both remain options.
 
 ## 9. Longer training (12,000 steps)
 
@@ -324,6 +336,31 @@ With three times the training, the picture changes in three ways:
   belongs to the briefly trained model.
 
 The cache, the warmup and the refresh behave as before (no measurable effect), and `churn` again does not help.
+
+A second sub-agent trained `nohetero` and `hetero_prob=0.25` (both `hetero_start=0`) for 12,000 steps:
+
+| 12,000 steps | v_uniform | v_mixed | x0_mse t<0.1 | x0_mse t 0.6-1 |
+| --- | --- | --- | --- | --- |
+| nohetero | 0.1357 | 0.1533 | 0.00081 | **0.10759** |
+| `hetero_prob=0.25` | **0.1331** | 0.1258 | 0.00073 | 0.10828 |
+| `hetero_prob=0.5` (above) | 0.1330 | **0.1242** | **0.00071** | 0.10906 |
+
+| FID, Euler (2,000 samples) | nohetero | `hetero_prob=0.25` | `hetero_prob=0.5` |
+| --- | --- | --- | --- |
+| dense, 16 steps | 41.04 | 40.97 | 42.50 / 41.68 |
+| dense, 32 steps | **39.63 / 38.78** | 40.02 / 39.39 | 41.76 |
+| noise mask, 16 steps (no speed cap) | 42.59 | 42.74 | 44.09 |
+| noise mask, 20 steps (no speed cap) | 42.02 | 41.55 | 42.89 |
+| noise mask, 32 steps (compute 0.84) | 41.89 / 41.80 | 40.19 / 39.73 | 41.60 |
+| noise mask + `reuse=0.5`, 32 steps (compute 0.60) | 41.86 | 41.92 | - |
+
+* A small share of mixed images costs the dense sampler almost nothing (40.02 / 39.39 against 39.63 / 38.78), and on
+  that model the noise mask is level with the dense sampler for 16% less compute.
+* Without a speed cap the noise mask is worse than the dense sampler at 16-20 steps on every model. This led to
+  `min_token_steps` (default 16): no token may take fewer steps than that, so the mask only speeds tokens up when
+  the run has steps to spare (16 steps: no speed-up; 20 steps: at most 1.36x; 32 steps: 2x as before).
+* `reuse=0.5` with Euler now costs about 2 FID - more than the gap between 16 and 32 dense steps - so at this
+  training length it is no better than taking fewer steps; `reuse=0.25` with DPM-Solver above is the better trade.
 
 <!-- REMOTE -->
 
