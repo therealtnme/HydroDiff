@@ -17,6 +17,7 @@ Every idea was measured on CIFAR-10 (32x32, class-conditional) with the 3M-param
 | Mixture-of-experts denoiser | No accuracy or speed gain at equal active compute at this scale; per-token routing makes single-image latency 57% worse. | Option, off by default |
 | Per-token fresh noise (`churn`) | No gain; worse when strong. | Dropped (default `0`) |
 | `hetero_start` (new) | Starts mixed-level training at the sampler's warmup; removes most of what mixed-level training costs the plain sampler. | Default |
+| Share of mixed images (`hetero_prob`) | 0.25 beat 0.5 by 0.6-1.4 FID in every sampler setting at 12,000 steps. | Default `0.25` |
 | `min_token_steps` (new) | No token may take fewer steps than this (16 with Euler, 10 with DPM-Solver; `reuse` always keeps 16 evaluations); prevents the quality loss of fast tokens on too coarse a time grid. | Default |
 
 ### Final model
@@ -59,7 +60,7 @@ HydroDiff is a diffusion transformer that works directly on pixel patches:
 
 Every patch token carries its **own** noise level `t` in `[0, 1]`.
 
-The model is conditioned on each token's noise level through per-token modulation. During training, half of the images (`hetero_prob`) get tokens at different noise levels: from progress `hetero_start` on, each token gets a speed `r` between `1` and `max_rate`, so its progress is `q + (r - 1) * (q - hetero_start)`, where `q` is the progress of the image.
+The model is conditioned on each token's noise level through per-token modulation. During training, a quarter of the images (`hetero_prob=0.25`) get tokens at different noise levels: from progress `hetero_start` on, each token gets a speed `r` between `1` and `max_rate`, so its progress is `q + (r - 1) * (q - hetero_start)`, where `q` is the progress of the image.
 
 These are exactly the states that the adaptive sampler produces, so there is no gap between training and sampling. `hetero_start=0.25` matches the sampler's warmup: the tokens only separate once the image has some structure. This removes most of the accuracy that mixed-level training otherwise costs the plain sampler at high noise.
 

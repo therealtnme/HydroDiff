@@ -33,6 +33,7 @@ evidence of anything.
 | Binary update mask: `reuse` the surest tokens' estimates | 29-36% less compute at the same quality at 32 steps with DPM-Solver (section 10); costs quality with too few steps; random choice of tokens works about as well (section 3). | Yes, option |
 | MoE denoiser (token, image or noise-level routing) | No accuracy or speed gain at equal active compute at 3M parameters; token routing is 57% slower for single images (section 6). | Option, off |
 | `hetero_start` (new): start mixed-level training at the sampler's warmup | Removes most of the cost of mixed-level training for the dense sampler (section 7). | Yes, default |
+| Share of mixed images `hetero_prob` | 0.25 beats 0.5 at 12,000 steps in every sampler setting (section 11). | Yes, default 0.25 |
 | `min_token_steps` (new): no token on a time grid coarser than the saturation point | Removes the noise mask's losses at 16-20 steps (sections 9, 10). | Yes, default |
 | DPM-Solver++(2M) per token | Worse than Euler on briefly trained models, better on trained ones and the better partner for the masks (sections 5, 9, 10). | Yes, default |
 | Long skips, v-prediction | Help the dense sampler only; no change under the noise mask (section 8). | Options |
@@ -388,8 +389,8 @@ A second sub-agent trained `nohetero` and `hetero_prob=0.25` (both `hetero_start
 
 ## 10. Final model
 
-The default configuration (`hydrodiff-s`, `hetero_prob=0.5`, `hetero_start=0.25`) trained for 12,000 steps (4 threads,
-92 minutes). Validation: v_uniform 0.1331, v_mixed 0.1256, x0_mse 0.00072 / 0.00558 / 0.02063 / 0.10843 - between the
+The default configuration at the time (`hydrodiff-s`, `hetero_prob=0.5`, `hetero_start=0.25`; section 11 then lowered
+the default `hetero_prob` to 0.25) trained for 12,000 steps (4 threads, 92 minutes). Validation: v_uniform 0.1331, v_mixed 0.1256, x0_mse 0.00072 / 0.00558 / 0.02063 / 0.10843 - between the
 12,000-step `hetero_prob=0.25` and `0.5` models of section 9 at high noise. The noise mask still follows detail
 (Spearman 0.57 at t = 0.3, 0.53 at t = 0.6).
 
@@ -451,6 +452,33 @@ What this settles:
   measured, in about the same time as the default sampler. The masks save compute at a given step count; they do not
   move the quality-per-compute frontier past "use a good solver and few steps" here. They matter where many steps
   are needed - larger images, harder data, higher quality - which this CPU bench cannot reach.
+
+## 11. Default share of mixed images: `hetero_prob=0.25`
+
+At 12,000 steps, `hetero_prob=0.25` (section 9, `hetero_start=0`) beat `hetero_prob=0.5` with both samplers. A remote
+sub-agent trained the combination with `hetero_start=0.25` for 12,000 steps to confirm it before it became the default
+(FID, 2,000 samples, two seeds where given):
+
+| 12,000 steps | v_uniform | v_mixed | x0_mse t<0.1 | x0_mse t 0.6-1 |
+| --- | --- | --- | --- | --- |
+| nohetero | 0.1357 | 0.1533 | 0.00081 | 0.10759 |
+| `hetero_prob=0.5`, `hetero_start=0.25` (section 10) | 0.1331 | 0.1256 | 0.00072 | 0.10843 |
+| **`hetero_prob=0.25`, `hetero_start=0.25` (new default)** | 0.1332 | 0.1275 | 0.00074 | **0.10749** |
+
+| Sampler | `hetero_prob=0.5` (section 10) | **`hetero_prob=0.25`** | nohetero (section 9) |
+| --- | --- | --- | --- |
+| Euler, dense, 16 steps | 42.63 | 41.66 | 41.04 |
+| Euler, dense, 32 steps | 41.94 / 40.54 | 41.04 / 39.94 | 39.63 / 38.78 |
+| Euler, noise mask, 32 steps (compute 0.84) | 42.08 / 40.32 | **40.69 / 39.53** | 41.89 / 41.80 |
+| Euler, noise mask, 20 steps (speed cap 1.36x) | 42.35 | 41.22 | - |
+| Euler, noise mask + `reuse=0.25`, 32 steps (compute 0.71) | 42.74 | 41.30 | - |
+| DPM-Solver, noise mask + `reuse=0.25`, 32 steps (compute 0.71) | 41.34 | **39.96** | - |
+
+The smaller share is better in every row, by 0.6-1.4 FID on paired seeds, and has the lowest high-noise error of all
+12,000-step models. With it, the noise mask at 32 steps is level with or better than its own dense sampler on both
+seeds (40.69 / 39.53 against 41.04 / 39.94) for 16% less compute, and the noise mask plus `reuse=0.25` with DPM-Solver
+(39.96 at compute 0.71) is within noise of the best dense result of any model (nohetero, 39.63 / 38.78) for 29% less
+compute. `hetero_prob=0.25` is the default from here on.
 
 ## Prior work
 
