@@ -62,6 +62,9 @@ class HydroDiffConfig(PreTrainedConfig):
             step after the first at sampling).
         contrastive_weight (`float`): Contrastive flow matching - push the prediction away from another image's target.
         dispersive_weight (`float`): Dispersive loss on the mid-network image representation.
+        guidance_scale (`float`), guidance_min_t (`float`), guidance_max_t (`float`): Default classifier-free guidance
+            of [`~HydroDiffForImageGeneration.generate`]: the scale, applied only to tokens whose noise level is in
+            `[guidance_min_t, guidance_max_t]` (guidance at the ends of the trajectory cost quality on the bench).
         num_experts (`int`): Routed experts per MoE layer (0 = dense MLPs).
         num_experts_per_tok (`int`), moe_intermediate_size (`int`), first_dense_layers (`int`),
         router_bias_update_rate (`float`): MoE shape and balancing-bias step.
@@ -103,6 +106,9 @@ class HydroDiffConfig(PreTrainedConfig):
     self_condition: bool = False
     contrastive_weight: float | int = 0.0
     dispersive_weight: float | int = 0.0
+    guidance_scale: float | int = 3.0
+    guidance_min_t: float | int = 0.2
+    guidance_max_t: float | int = 0.85
 
     num_experts: int = 0
     num_experts_per_tok: int = 1

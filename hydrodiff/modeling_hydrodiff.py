@@ -548,7 +548,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         labels: torch.Tensor | None = None,
         batch_size: int | None = None,
         steps: int = 16,
-        guidance_scale: float = 1.0,
+        guidance_scale: float | None = None,
         adaptive: bool = True,
         max_rate: float | None = None,
         warmup: float = 0.25,
@@ -593,7 +593,8 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         Guidance (`guidance_scale` > 1) mixes in a reference velocity: the unconditional model (classifier-free
         guidance), the unconditional model without the blocks in `uncond_skip_layers` (as MOSS-Image does), or a
         weaker `guide_model` given the same labels (autoguidance). `guidance_interval=(lo, hi)` applies it only to
-        tokens whose noise level is in that range; `guidance_schedule="linear"` raises the scale from 1 at pure noise to
+        tokens whose noise level is in that range; both default to the configuration (scale 3 on `[0.2, 0.85]`; pass
+        `guidance_scale=1` for unguided sampling at half the cost); `guidance_schedule="linear"` raises the scale from 1 at pure noise to
         `2 * guidance_scale - 1` at the clean end (same mean); `cfg_zero=True` applies CFG-Zero* (the reference is
         scaled by its projection on the conditional velocity, and the first step is skipped). `time_shift` overrides
         the configuration's schedule shift.
@@ -633,6 +634,10 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         evaluations = torch.zeros(b, n, device=device)  # steps in which each token was run while it still had noise
         just_finished = torch.zeros(b, n, dtype=torch.bool, device=device)
         caches = (HydroDiffTokenCache(), HydroDiffTokenCache())
+        if guidance_scale is None:
+            guidance_scale = cfg.guidance_scale
+        if guidance_interval is None:
+            guidance_interval = (cfg.guidance_min_t, cfg.guidance_max_t)
         guidance = (guidance_scale, guidance_interval, tuple(uncond_skip_layers), guide_model, guidance_schedule, cfg_zero)
         shift = cfg.time_shift if time_shift is None else time_shift
         to_t = lambda q: shift_time(1 - q, shift)

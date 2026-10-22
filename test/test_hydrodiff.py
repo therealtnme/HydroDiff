@@ -23,7 +23,10 @@ from hydrodiff.modeling_hydrodiff import (  # noqa: E402
 from hydrodiff.optimization_hydrodiff import Muon, build_optimizers  # noqa: E402
 
 
-TINY = dict(hidden_size=64, intermediate_size=128, num_attention_heads=2, num_hidden_layers=2, image_size=16, patch_size=4)
+TINY = dict(
+    hidden_size=64, intermediate_size=128, num_attention_heads=2, num_hidden_layers=2, image_size=16, patch_size=4,
+    guidance_scale=1,  # unguided by default, so that each check below sees one model pass per step
+)
 TINY_MOE = dict(num_experts=4, moe_intermediate_size=64)
 
 # name -> (preset, overrides on top of TINY)
@@ -482,3 +485,10 @@ def test_guidance_schedule_and_cfg_zero(make_model):
     for out in (linear, zero):
         assert torch.isfinite(out.images).all() and not torch.allclose(out.images, constant.images)
     torch.testing.assert_close(sample(model, cfg_zero=True).images, sample(model).images)  # no guidance: no change
+
+
+def test_generate_uses_the_configured_guidance(make_model):
+    model = make_model(guidance_scale=3, guidance_min_t=0.2, guidance_max_t=0.85)
+    explicit = sample(model, guidance_scale=3.0, guidance_interval=(0.2, 0.85))
+    torch.testing.assert_close(sample(model).images, explicit.images)
+    assert not torch.allclose(sample(model, guidance_scale=1.0).images, explicit.images)

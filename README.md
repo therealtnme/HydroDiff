@@ -18,6 +18,7 @@ Every idea was measured on CIFAR-10 (32x32, class-conditional) with the 3M-param
 | Per-token fresh noise (`churn`) | No gain; worse when strong. | Dropped (default `0`) |
 | `hetero_start` (new) | Starts mixed-level training at the sampler's warmup; removes most of what mixed-level training costs the plain sampler. | Default |
 | Share of mixed images (`hetero_prob`) | 0.25 beat 0.5 by 0.6-1.4 FID in every sampler setting at 12,000 steps. | Default `0.25` |
+| Classifier-free guidance on noise levels 0.2-0.85 | Scale 3 on that interval is about 8 FID better than no guidance (32.16 / 32.00 against 41.45 / 40.04) and 1 FID better than the best scale on all levels. CFG-Zero\*, leaving a block out of the unconditional pass (MOSS-Image) and autoguidance did not help. Costs a second model pass. | Default |
 | `min_token_steps` (new) | No token may take fewer steps than this (16 with Euler, 10 with DPM-Solver; `reuse` always keeps 16 evaluations); prevents the quality loss of fast tokens on too coarse a time grid. | Default |
 
 ### Final model
@@ -31,6 +32,10 @@ Every idea was measured on CIFAR-10 (32x32, class-conditional) with the 3M-param
 | dense, 12 steps | 39.96 | 1.00 | 39 |
 | dense, 32 steps | 41.61 | 1.00 | - |
 | noise mask + `reuse=0.25`, 32 steps | 39.96 | 0.71 | - |
+
+These numbers are without guidance. With the default guidance (scale 3 on noise levels 0.2-0.85) the same sampler gives **32.16 / 32.00** on the earlier final model (dense: 31.68), about 8 FID better, for about 2.4 times the time per image; `guidance_scale=1` turns it off (see [`test/RESEARCH.md`](test/RESEARCH.md), section 12).
+
+![The same starting noise without guidance (left) and with the default guidance (right)](test/figures/guidance.png)
 
 The default sampler is 0.5 FID better than the dense sampler on both seeds and 13% faster. With Euler at 32 steps the noise mask gives 40.69 / 39.53 against 41.04 / 39.94 for 84% of the compute. An earlier final model (`hetero_prob=0.5`) was also checked with 5,000 samples: noise mask 33.52 against dense 33.43 (Euler, 32 steps, 84% of the compute).
 
@@ -141,7 +146,8 @@ At the scale tested (3M active parameters, CPU), the experts gave no measurable 
 * `solver="dpm2m"` (default): DPM-Solver++(2M), run **per token** so that every token uses its own step sizes
 * `solver="euler"`: first-order step on the clean-patch estimate (DDIM form)
 * `steps` (default `16`)
-* `guidance_scale`: classifier-free guidance
+* `guidance_scale`, `guidance_interval` (default: the configuration's scale 3 on noise levels 0.2-0.85): classifier-free guidance
+* `guidance_schedule="linear"`, `cfg_zero`, `uncond_skip_layers`, `guide_model` (autoguidance): other guidance forms
 * `adaptive`, `max_rate`, `warmup`, `min_token_steps`: the noise mask
 * `reuse`, `reuse_by`, `skip_finished`, `refresh_finished`: the update mask
 * `churn`: per-token fresh noise (Euler only)

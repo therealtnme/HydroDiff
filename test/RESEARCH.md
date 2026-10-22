@@ -37,6 +37,7 @@ evidence of anything.
 | `min_token_steps` (new): no token on a time grid coarser than the saturation point | Removes the noise mask's losses at 16-20 steps (sections 9, 10). | Yes, default |
 | DPM-Solver++(2M) per token | Worse than Euler on briefly trained models, better on trained ones and the better partner for the masks (sections 5, 9, 10). | Yes, default |
 | Long skips, v-prediction | Help the dense sampler only; no change under the noise mask (section 8). | Options |
+| Classifier-free guidance, scale 3 on noise levels 0.2-0.85 | About 8 FID better than no guidance; the noise mask keeps its saving. CFG-Zero*, a skipped block in the unconditional pass and autoguidance did not help (section 12). | Yes, default |
 
 The user's three hypotheses, as measured:
 
@@ -492,6 +493,59 @@ The default sampler on this model (FID, 2,000 samples; speed alone on the sub-ag
 On the default model the default sampler is 0.47 and 0.54 FID better than the dense sampler on the two seeds and 13%
 faster - a small but consistent gain. Dense DPM-Solver with 12 steps is as good and faster still, so the conclusion of
 section 10 stands: on this bench the step count is the bigger lever.
+
+## 12. Image quality: guidance
+
+Every number above samples without guidance (`guidance_scale=1`). This section looks for better images, with the
+MOSS-Image technical report (arXiv 2610.23374) as one source: a 5B single-stream DiT that samples with classifier-free
+guidance 3, leaves block 22 out of the unconditional pass, shifts the time grid by 5, and trains with an unweighted
+velocity loss on noise levels skewed towards pure noise.
+
+All on the 12,000-step model of section 10 (`hetero_prob=0.5`), DPM-Solver, 16 steps, noise mask, 2,000 samples. Two
+values are two sampling seeds. Compute does not count the reference pass that guidance adds.
+
+| Setting | FID | Compute |
+| --- | --- | --- |
+| no guidance (section 10) | 41.45 / 40.04 | 0.89 |
+| scale 1.5 | 35.75 / 34.90 | 0.89 |
+| scale 2 | 33.23 / 32.79 | 0.89 |
+| scale 3 | 35.51 | 0.89 |
+| scale 4 | 41.09 | 0.89 |
+| scale 2, dense sampler | 32.98 | 1.00 |
+| scale 2.5, noise levels 0.2-0.85 only | 33.03 / 32.77 | 0.89 |
+| **scale 3, noise levels 0.2-0.85 only (new default)** | **32.16 / 32.00** | **0.89** |
+| scale 3, noise levels 0.2-0.85, dense sampler | 31.68 | 1.00 |
+| scale 3, noise levels 0.2-0.85, 12 steps | 32.51 | 1.00 |
+| scale 3, noise levels 0.1-0.9 | 32.69 | 0.89 |
+| scale 4, noise levels 0.2-0.85 | 32.27 | 0.89 |
+| scale 2, linear schedule (`guidance_schedule="linear"`) | 32.88 | 0.89 |
+| scale 3, linear schedule | 32.15 | 0.89 |
+| scale 2, CFG-Zero* (`cfg_zero=True`) | 41.00 | 0.89 |
+| scale 3, CFG-Zero* | 38.49 | 0.89 |
+| scale 2, block 3 left out of the unconditional pass (as MOSS-Image) | 48.26 | 0.89 |
+| scale 2, autoguidance (guide: the 4,000-step model) | 33.71 | 0.89 |
+| scale 2, autoguidance, linear schedule | 35.88 | 0.89 |
+| scale 2, time shift 2 | 34.23 | 0.89 |
+| scale 2, Euler, 32 steps | 34.76 | 0.84 |
+
+A remote sub-agent repeated the scale sweep on the default model (`hetero_prob=0.25`, section 11): no guidance
+39.87 / 38.91, scale 1.5 35.17, scale 2 33.05 / 32.58 (dense: 32.76), scale 3 35.07, scale 4 40.77.
+
+* Guidance is the largest quality gain of the project: about 8 FID. FID is U-shaped in the scale; with guidance on all
+  noise levels the best scale is 2.
+* Guidance only between noise levels 0.2 and 0.85 (Kynkäänniemi et al., 2024) allows a higher scale: scale 3 on that
+  interval is about 1 FID better than scale 2 everywhere, on both seeds. A linear schedule (weak at pure noise, strong
+  near the end) does as well. The interval is the default (`guidance_scale=3`, `guidance_min_t=0.2`,
+  `guidance_max_t=0.85` in the configuration).
+* The noise mask keeps its place under guidance: within 0.5 FID of the dense sampler for 11% less compute.
+* What did not carry over to this scale: leaving a block out of the unconditional pass (MOSS-Image) costs 15 FID with
+  6 blocks; CFG-Zero* costs 5-8 FID (it was designed for flow models whose first velocity estimate is poor); the
+  time shift that suits 1024-pixel images is wrong for 32-pixel ones; autoguidance with an earlier checkpoint of a
+  different run is worse than the unconditional reference.
+* Cost: guidance runs a second pass for every token, so a guided image takes about 2.4 times as long (69 against
+  29 ms per image in a batch of 100 on 4 threads). `guidance_scale=1` gives unguided sampling.
+
+![The same starting noise without guidance (left) and with the default guidance (right)](figures/guidance.png)
 
 ## Prior work
 
