@@ -124,7 +124,9 @@ special training, because the tokens stay on their own clocks:
 | --- | --- | --- | --- |
 | nohetero, dense | 49.27 / 48.09 | 1.00 | 252 |
 | nohetero, `reuse=0.25` | 48.24 | 0.82 | 217 |
-| nohetero, `reuse=0.5` | 48.81 | **0.64** | **151** |
+| nohetero, `reuse=0.25`, random tokens | 48.96 | 0.82 | 196 |
+| nohetero, `reuse=0.5` | 48.81 / 47.76 | **0.64** | **151** |
+| nohetero, `reuse=0.5`, random tokens | 48.87 | 0.64 | 139 |
 | nohetero, `reuse=0.5`, DPM-Solver | 48.49 | 0.64 | 158 |
 | nohetero, `reuse=0.25`, DPM-Solver | **47.63** | 0.82 | 221 |
 | base, dense | 51.96 / 51.05 | 1.00 | 233 |
@@ -134,9 +136,15 @@ special training, because the tokens stay on their own clocks:
 | base, noise mask + `reuse=0.5` + `max_rate=3` | 51.88 | 0.55 | 129 |
 | base, `reuse=0.5` only | 51.65 | 0.64 | 152 |
 
-The update mask is the clearest speed win: it saves a third of the compute (1.6-1.7x less wall-clock time) at the same FID.
-At few steps it costs quality instead: base, Euler 16 steps, `reuse=0.25` gives 53.04 (compute 0.76) against 51.03 for
-the noise mask alone (0.89) - no better than simply taking fewer steps.
+The update mask is the clearest speed win: it saves a third of the compute (1.6-1.7x less wall-clock time) at the same
+or slightly better FID (paired over two seeds: 0.46 and 0.33 better for `nohetero`, `reuse=0.5`). Which tokens skip
+matters little: at `reuse=0.5` picking them at random is as good as picking the surest (48.87 against 48.81), as DuCa
+found for token caching; at `reuse=0.25` the uncertainty ranking is 0.7 FID ahead on one seed. The gain comes from
+spending fewer evaluations per token while every token keeps a fine time grid.
+
+It needs enough steps to work with. At 16 steps it costs quality instead: `nohetero`, `reuse=0.5` gives 51.61 (compute
+0.66) against 50.79 dense, and base, `reuse=0.25` gives 53.04 (compute 0.76) against 51.03 for the noise mask alone
+(0.89) - no better than simply taking fewer steps.
 
 (`ms / image` was measured with four evaluations sharing the CPU, one thread each; it tracks `compute` closely.)
 
@@ -186,6 +194,94 @@ keep the latency of the dense model, since at batch 1 nearly every token goes to
 This matches the literature: token-level MoE wins at equal active FLOPs from B scale up, with long training on
 accelerators. `num_experts=0` (dense) stays the default; the three routing modes stay available, and `time` routing is
 the one to try first at a larger scale (no router, no balancing, no latency cost).
+
+## 7. Removing the training cost: `hetero_start`
+
+The sampler's tokens only start to separate after its warmup (25% of the steps), but mixed-level training spread token
+speeds from pure noise on. At high noise that teaches the model to copy from cleaner neighbours that it never has when
+sampling. `hetero_start=0.25` starts the spread at the same progress as the sampler, so training covers the sampler's
+states and nothing else:
+
+| Model | v_uniform | v_mixed | x0_mse t<0.1 | x0_mse t 0.6-1 |
+| --- | --- | --- | --- | --- |
+| nohetero | 0.1444 | 0.1577 | 0.00096 | **0.11054** |
+| base (`hetero_start=0`) | 0.1385 | **0.1314** | **0.00077** | 0.11307 |
+| **hs25** (`hetero_start=0.25`) | **0.1380** | 0.1322 | 0.00078 | 0.11146 |
+| hs25, `hetero_prob=0.25` | 0.1386 | 0.1339 | 0.00080 | 0.11136 |
+
+| FID (2,000 samples), Euler | nohetero | base | **hs25** | hs25, `hetero_prob=0.25` |
+| --- | --- | --- | --- | --- |
+| dense, 16 steps | **50.79** | 51.99 / 51.36 | 51.00 | 50.96 |
+| dense, 32 steps | **49.27 / 48.09** | 51.96 / 51.05 | 50.80 | 50.64 |
+| noise mask, 20 steps (compute 0.87) | - | 50.33 | **49.26** | 49.85 |
+| noise mask, 32 steps (compute 0.84) | 50.20 | 49.67 / 48.91 | **49.06** | 49.34 |
+| noise mask + `reuse=0.5`, 32 steps (compute 0.60) | - | 50.76 | 49.61 | - |
+| `reuse=0.5`, 32 steps (compute 0.64) | 48.81 | 51.65 | 50.44 | - |
+
+`hetero_start` keeps the low-noise gain and recovers most of the high-noise loss: the dense sampler is now level with
+`nohetero` at 16 steps and 1-2 FID behind at 32. With the noise mask, hs25 at 20 steps (17.4 effective steps) reaches
+49.26 - 1.5 FID better than `nohetero` at 16 dense steps for about the same compute, and as good as `nohetero` at 32
+steps for 54% of its compute. `hetero_start=0.25` is the default from here on; the share of mixed images (0.5 or 0.25)
+makes no measurable difference.
+
+### Share of mixed images and training spread (`hetero_start=0`)
+
+A remote sub-agent trained a grid of `hetero_prob` and training `max_rate` (FID, Euler, 32 steps, compute in brackets):
+
+| `hetero_prob` / training `max_rate` | x0_mse t 0.6-1 | dense | noise mask | noise mask, `max_rate=3` | noise mask + `reuse=0.5` |
+| --- | --- | --- | --- | --- | --- |
+| 0 (nohetero) | 0.11054 | 49.27 / 48.09 | 50.20 (0.84) | - | - |
+| 0.15 / 2 | 0.11204 | 49.59 | 48.78 (0.84) | 48.94 (0.74) | 49.59 (0.60) |
+| 0.3 / 2 | 0.11189 | 51.46 | 49.30 (0.84) | 48.97 (0.74) | 49.74 (0.60) |
+| 0.5 / 2 (base) | 0.11307 | 51.96 / 51.05 | 49.67 / 48.91 (0.84) | 49.58 (0.74) | 50.76 (0.60) |
+| 0.15 / 3 | 0.11180 | 50.70 | 49.02 (0.74) | - | 50.83 (0.55) |
+| 0.3 / 3 | 0.11244 | 50.93 | **48.23** (0.74) | - | 50.19 (0.55) |
+
+On every model trained with mixed levels the noise mask is as good as or better than the dense sampler for 16-26%
+less compute, and with the noise mask all of them land within noise of each other (48.2-49.7). A small share of mixed
+images (0.15) protects the dense sampler almost completely; `hetero_start` (above) does the same at the default share.
+
+### Measured speed (hs25)
+
+Alone on the machine, 4 CPU threads, two repeats (the spread between repeats is up to 15%):
+
+| Sampler | FID | Compute | ms / image, batch 250 | ms / image, batch 1 |
+| --- | --- | --- | --- | --- |
+| dense, 32 steps | 50.80 | 1.00 | 82 | 180 |
+| dense, 16 steps | 51.00 | 1.00 | 37 | 103 |
+| noise mask, 32 steps | **49.06** | 0.84 | 65 | 192 |
+| noise mask, 20 steps | 49.26 | 0.87 | 46 | 129 |
+| noise mask + `reuse=0.5`, 32 steps | 49.61 | 0.60 | **40** | 182 |
+| `reuse=0.5`, 32 steps | 50.44 | 0.64 | 42 | 171 |
+| noise mask, every token computed (`skip_finished=False`), 32 steps | - | 1.00 | 76 | 203 |
+
+When images are generated in batches, wall-clock time follows the compute: the two masks together make 32-step
+sampling 2x faster and better than the dense sampler (49.61 against 50.80), and they reach better quality than dense
+16-step sampling (51.00) in about the same time. For a single image they do not help: a 64-token step on a CPU is
+dominated by fixed per-step costs, so only the number of steps matters, and the masks' bookkeeping (ranking, gather,
+scatter) is not free. The masks pay off when the work per step is large - batches, larger images, more tokens.
+
+## 8. Architecture ablations
+
+Same training as `base` (`hetero_prob=0.5`, `hetero_start=0`), one change each. FID at 32 steps, two seeds:
+
+| Model | Params | v_uniform | x0_mse t 0.6-1 | DPM dense | DPM noise mask | Euler dense | Euler noise mask |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| control (x-prediction) | 3.07M | **0.1383** | 0.11259 | 53.12 | 51.79 | 51.36 / 50.07 | 49.39 / 48.12 |
+| v-prediction | 3.07M | 0.1531 | 0.11316 | 49.76 | 49.41 | 49.87 / 48.50 | 49.93 / 48.59 |
+| U-ViT long skips | 3.29M | 0.1384 | **0.11225** | 49.35 | **48.97** | **49.22 / 48.47** | 49.26 / 48.31 |
+| trained with `max_rate=3` | 3.07M | 0.1392 | 0.11319 | 53.57 | 51.32 (compute 0.74) | - | - |
+
+(`v_uniform` is not comparable between x- and v-prediction: the loss weights differ.)
+
+* **DPM-Solver hid the picture.** With DPM-Solver the control looked 3-4 FID behind v-prediction and long skips; with
+  Euler every model ends at the same quality under the noise mask (49.3 / 48.3).
+* **Long skips and v-prediction help the dense sampler only.** They remove the dense-sampler cost of mixed-level
+  training (dense = noise mask for both), so the noise mask has nothing left to win back; they do not raise the best
+  result. Long skips cost 7% more parameters and about 7% more compute per token.
+* **`max_rate=3` in training** is no better than training with 2 and sampling with 3 (section 2).
+
+x-prediction stays the default (it is the safer choice for larger patches), and long skips stay an option.
 
 <!-- REMOTE -->
 

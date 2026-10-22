@@ -27,9 +27,9 @@ HydroDiff is a diffusion transformer that works directly on pixel patches:
 
 Every patch token carries its **own** noise level `t` in `[0, 1]`.
 
-The model is conditioned on each token's noise level through per-token modulation. During training, half of the images get tokens at different noise levels: each token gets a speed between `1` and `max_rate`, so its noise level lies between `1 - q` and `1 - q * max_rate`, where `q` is the progress of the image.
+The model is conditioned on each token's noise level through per-token modulation. During training, half of the images (`hetero_prob`) get tokens at different noise levels: from progress `hetero_start` on, each token gets a speed `r` between `1` and `max_rate`, so its progress is `q + (r - 1) * (q - hetero_start)`, where `q` is the progress of the image.
 
-These are exactly the states that the adaptive sampler produces, so there is no gap between training and sampling.
+These are exactly the states that the adaptive sampler produces, so there is no gap between training and sampling. `hetero_start=0.25` matches the sampler's warmup: the tokens only separate once the image has some structure. This removes most of the accuracy that mixed-level training otherwise costs the plain sampler at high noise.
 
 Tokens that are already clean (`t = 0`) are context, not targets: they take no part in the loss.
 
@@ -57,14 +57,18 @@ speed = max_rate ** (1 - rank)
 
 Unpredictable texture is therefore generated **after** the structure around it is known, which is the accuracy argument of the noise mask.
 
-The `churn` option is the second form of the noise mask: it replaces a share of each token's noise with fresh noise in every step, scaled by the same uncertainty rank, so the tokens the model cannot predict get the most fresh noise.
+The uncertainty head does find that texture: its predicted error ranks against the high-frequency energy of the clean patch with a Spearman correlation of 0.67 at `t = 0.3` and 0.57 at `t = 0.6`, before the detail is visible. In generated images, sky and flat backgrounds finish first and objects and texture finish last:
+
+![Generated images (top) and the step at which each token finished (bottom: dark = first, bright = last)](test/figures/noise_mask.png)
+
+The `churn` option is the second reading of "how much noise is applied where": it replaces a share of each token's noise with fresh noise in every step, scaled by the same uncertainty rank. It was measured and gives no gain (worse when strong), so it defaults to `0`.
 
 ### Binary update mask
 
 After the noise mask, the model **predicts the update mask**: which tokens need to be computed in this step. Each value is `0` or `1`.
 
-* A token that has reached `t = 0` leaves the update mask for good.
-* With `reuse > 0`, a share of the surest moving tokens also skips the network in a step and moves with its estimate from the step before (never two steps in a row).
+* A token that has reached `t = 0` leaves the update mask for good. Skipping it is exact, and the cached keys and values cost no measurable quality.
+* With `reuse > 0`, a share of the surest moving tokens also skips the network in a step and moves with its estimate from the step before (never two steps in a row, never on its last step). `reuse=0.5` takes a third of the compute out of 32-step sampling at equal quality. `reuse_by="random"` picks the skipped tokens at random instead; at `reuse=0.5` that works as well, so most of the gain comes from skipping, not from which tokens skip.
 
 The update mask is **not** applied by running the denoiser on every token and restoring the masked tokens afterwards. HydroDiff gathers only the tokens in the update mask and runs the transformer on those tokens only:
 
@@ -95,6 +99,8 @@ The MLPs can be fine-grained mixtures of experts with one always-on shared exper
 
 Because the update mask removes tokens before the blocks run, the experts only process the tokens that are active in the step.
 
+At the scale tested (3M active parameters, CPU), the experts gave no measurable gain in accuracy or speed at equal active compute, and per-token routing makes single-image latency 57% worse. Dense MLPs (`num_experts=0`) are therefore the default; `time` routing (no router, no balancing, no latency cost) is the mode to try first at a larger scale.
+
 ### Samplers
 
 `generate` supports:
@@ -103,8 +109,10 @@ Because the update mask removes tokens before the blocks run, the experts only p
 * `solver="dpm2m"`: DPM-Solver++(2M), run **per token** so that every token uses its own step sizes
 * `guidance_scale`: classifier-free guidance
 * `adaptive`, `max_rate`, `warmup`: the noise mask
-* `reuse`, `skip_finished`: the update mask
+* `reuse`, `reuse_by`, `skip_finished`, `refresh_finished`: the update mask
 * `churn`: per-token fresh noise
+
+On this bench `euler` beats `dpm2m`, and the noise mask with `max_rate=3` keeps its quality at 32 steps for 12% less compute but hurts at 16 steps or fewer.
 
 ## Architecture
 
