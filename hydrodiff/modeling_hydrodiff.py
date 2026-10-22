@@ -408,16 +408,17 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
     def sample_timesteps(self, batch: int, device, generator=None) -> torch.Tensor:
         """
         Per-token noise levels for training. Each image gets a logit-normal progress `q` (how far denoising has got).
-        A `hetero_prob` share of images also gets a per-token speed in [1, max_rate], so their tokens sit between
-        `t = 1 - q` and `t = 1 - q * max_rate`: the states the adaptive sampler produces, where confident tokens are
-        ahead of (cleaner than) the rest.
+        A `hetero_prob` share of images also gets a per-token speed `r` in [1, max_rate] from progress `hetero_start`
+        on, so a token's progress is `q + (r - 1) * (q - hetero_start)`: the states the adaptive sampler produces, where
+        confident tokens are ahead of (cleaner than) the rest once its warmup is over.
         """
         cfg, n = self.config, self.config.num_patches
         q = 1 - torch.sigmoid(torch.randn(batch, 1, device=device, generator=generator))
         rate = 1 + (cfg.max_rate - 1) * torch.rand(batch, n, device=device, generator=generator)
         hetero = torch.rand(batch, 1, device=device, generator=generator) < cfg.hetero_prob
         rate = torch.where(hetero, rate, torch.ones_like(rate))
-        return shift_time((1 - q * rate).clamp(0, 1), cfg.time_shift)
+        progress = q + (rate - 1) * (q - cfg.hetero_start).clamp_min(0)
+        return shift_time((1 - progress).clamp(0, 1), cfg.time_shift)
 
     def velocity(self, prediction: torch.Tensor, noisy_tokens: torch.Tensor, timesteps: torch.Tensor, min_t: float = 0.0):
         if self.config.prediction_type == "v":

@@ -49,6 +49,8 @@ class HydroDiffConfig(PreTrainedConfig):
             (the network outputs the velocity). Pixel patches are high-dimensional, which favours `"x"`.
         time_shift (`float`): Resolution shift of the noise schedule, `t' = s t / (1 + (s - 1) t)`.
         hetero_prob (`float`): Fraction of training images whose tokens get different noise levels.
+        hetero_start (`float`): Progress (0 = pure noise, 1 = clean) from which those tokens' speeds differ. Matching
+            the sampler's `warmup` keeps training on the states the sampler produces and nothing else.
         max_rate (`float`): Largest per-token speed-up, both in training (the spread of noise levels) and at sampling.
         uncertainty_loss_weight (`float`): Weight of the head that predicts each token's denoising error; its output
             is the noise mask.
@@ -84,6 +86,7 @@ class HydroDiffConfig(PreTrainedConfig):
     prediction_type: str = "x"
     time_shift: float | int = 1.0
     hetero_prob: float | int = 0.5
+    hetero_start: float | int = 0.0
     max_rate: float | int = 2.0
     uncertainty_loss_weight: float | int = 0.1
 
@@ -105,6 +108,8 @@ class HydroDiffConfig(PreTrainedConfig):
             raise ValueError("num_experts_per_tok must be in [1, num_experts]")
         if self.moe_routing not in ("token", "image", "time"):
             raise ValueError("moe_routing must be 'token', 'image' or 'time'")
+        if not 0 <= self.hetero_start < 1:
+            raise ValueError("hetero_start must be in [0, 1)")
         if self.max_rate < 1:
             raise ValueError("max_rate must be >= 1")
         super().__post_init__(**kwargs)
