@@ -23,7 +23,30 @@ FID noise: the same setting with a different sampling seed moved by 0.6-1.2 FID 
 differences between settings are paired and somewhat less noisy than that, but differences under about 1 FID are not
 evidence of anything.
 
-<!-- SUMMARY -->
+## Summary
+
+| Idea | Result | Kept? |
+| --- | --- | --- |
+| Non-binary noise mask: per-token noise level, set by a predicted uncertainty | Finds unpredictable detail (Spearman 0.53-0.67 against high-frequency energy). Keeps the dense sampler's quality for 11-16% less compute (sections 2, 9, 10). Improved FID by about 2 on briefly trained models, level on longer-trained ones. Needs mixed-level training, and enough steps per token (section 9). | Yes, default |
+| Non-binary noise mask as per-token fresh noise (`churn`) | No gain; worse when strong (section 4). | Dropped |
+| Binary update mask: skip finished tokens, cache their keys and values | Exact; the cache costs no measurable quality (sections 3, 9). | Yes, default |
+| Binary update mask: `reuse` the surest tokens' estimates | 29-36% less compute at the same quality at 32 steps with DPM-Solver (section 10); costs quality with too few steps; random choice of tokens works about as well (section 3). | Yes, option |
+| MoE denoiser (token, image or noise-level routing) | No accuracy or speed gain at equal active compute at 3M parameters; token routing is 57% slower for single images (section 6). | Option, off |
+| `hetero_start` (new): start mixed-level training at the sampler's warmup | Removes most of the cost of mixed-level training for the dense sampler (section 7). | Yes, default |
+| `min_token_steps` (new): no token on a time grid coarser than the saturation point | Removes the noise mask's losses at 16-20 steps (sections 9, 10). | Yes, default |
+| DPM-Solver++(2M) per token | Worse than Euler on briefly trained models, better on trained ones and the better partner for the masks (sections 5, 9, 10). | Yes, default |
+| Long skips, v-prediction | Help the dense sampler only; no change under the noise mask (section 8). | Options |
+
+The user's three hypotheses, as measured:
+
+1. *Non-binary masks improve accuracy on unpredictable texture.* The mask does single out that texture and, by
+   finishing it last, improved FID on briefly trained models; on longer-trained models the accuracy effect is within
+   noise. What remains is a compute saving at equal quality.
+2. *Binary masks improve speed by not computing what does not need computing.* Yes - only the active tokens are
+   gathered and run, so the saving is real (19% wall-clock at the default 16 steps, about 40% at 32 steps with
+   `reuse`), as long as the work per step is large enough (batches, not a single tiny image on a CPU).
+3. *A mixture of experts improves speed and accuracy.* Not at this scale: no gain at equal active compute, and
+   slower training and single-image latency.
 
 ## 1. Mixed noise levels in training (`hetero_prob`)
 
@@ -362,6 +385,74 @@ A second sub-agent trained `nohetero` and `hetero_prob=0.25` (both `hetero_start
 * `reuse=0.5` with Euler now costs about 2 FID - more than the gap between 16 and 32 dense steps - so at this
   training length it is no better than taking fewer steps; `reuse=0.25` with DPM-Solver above is the better trade.
 
+## 10. Final model
+
+The default configuration (`hydrodiff-s`, `hetero_prob=0.5`, `hetero_start=0.25`) trained for 12,000 steps (4 threads,
+92 minutes). Validation: v_uniform 0.1331, v_mixed 0.1256, x0_mse 0.00072 / 0.00558 / 0.02063 / 0.10843 - between the
+12,000-step `hetero_prob=0.25` and `0.5` models of section 9 at high noise. The noise mask still follows detail
+(Spearman 0.57 at t = 0.3, 0.53 at t = 0.6).
+
+![100 samples, one class per column (airplane, automobile, bird, cat, deer, dog, frog, horse, ship, truck)](figures/samples.png)
+
+FID with 5,000 samples (Euler, 32 steps):
+
+| Sampler | FID | Compute | ms / image (4 parallel jobs) |
+| --- | --- | --- | --- |
+| dense | 33.43 | 1.00 | 259 |
+| noise mask | **33.52** | **0.84** | 217 |
+| noise mask + `reuse=0.25` | 34.46 | 0.71 | 172 |
+| noise mask + `reuse=0.5` | 35.66 | 0.61 | 146 |
+
+FID with 2,000 samples (two seeds where given):
+
+| Sampler | FID | Compute |
+| --- | --- | --- |
+| Euler, dense, 16 steps | 42.63 | 1.00 |
+| Euler, dense, 32 steps | 41.94 / 40.54 | 1.00 |
+| Euler, noise mask, 32 steps | 42.08 / 40.32 | 0.84 |
+| Euler, noise mask, 20 steps (speed cap 1.36x) | 42.35 | 0.97 |
+| Euler, noise mask, 16 / 20 steps, no speed cap | 44.46 / 43.48 | 0.89 / 0.87 |
+| Euler, noise mask, `max_rate=3`, 32 steps | 43.54 | 0.74 |
+| Euler, `reuse=0.5`, 32 steps | 42.38 | 0.64 |
+| DPM-Solver, dense, 12 steps | 41.72 | 1.00 |
+| DPM-Solver, dense, 16 steps | 41.59 / 40.39 | 1.00 |
+| DPM-Solver, dense, 32 steps | 42.66 | 1.00 |
+| **DPM-Solver, noise mask, 16 steps (the default sampler)** | **41.45 / 40.04** | **0.89** |
+| DPM-Solver, noise mask, 20 steps | 41.71 | 0.87 |
+| DPM-Solver, noise mask, 32 steps | 42.70 | 0.84 |
+| DPM-Solver, noise mask, `max_rate=3`, 32 steps | 41.75 | 0.74 |
+| DPM-Solver, noise mask + `reuse=0.25`, 32 steps | **41.34** | **0.71** |
+| DPM-Solver, `reuse=0.5`, 32 steps | 42.06 | 0.64 |
+| DPM-Solver, noise mask + `reuse=0.25`, 16 steps (before the `reuse` floor) | 43.79 | 0.77 |
+
+Speed alone on the machine (4 threads, batch 250, two repeats):
+
+| DPM-Solver sampler | ms / image | Compute |
+| --- | --- | --- |
+| dense, 12 steps | 33 | 1.00 |
+| dense, 16 steps | 42 | 1.00 |
+| **noise mask, 16 steps (default)** | **34** | 0.89 |
+| dense, 32 steps | 82 | 1.00 |
+| noise mask + `reuse=0.25`, 32 steps | 50 | 0.71 |
+| `reuse=0.5`, 32 steps | 47 | 0.64 |
+
+What this settles:
+
+* **At their defaults the masks cost no quality and save 11-16% of the compute** (19% wall-clock at the default 16
+  steps); at 32 steps, `reuse` raises the saving to 29-36% at the same quality with DPM-Solver (39-43% wall-clock).
+* **With longer training, DPM-Solver is the better partner for the masks**: it is as good with 12-16 steps as Euler
+  with 32, and it tolerates the coarser time grid of a fast token, where Euler loses quality. The defaults are
+  therefore `solver="dpm2m"`, `steps=16`, and `min_token_steps` 10 for DPM-Solver (16 for Euler).
+* **`reuse` needs the first-order floor even with DPM-Solver**: a reused token's next step is first order, and at 16
+  steps `reuse=0.25` cost 2.2 FID. `reuse` therefore keeps every token at 16 or more evaluations unless
+  `min_token_steps` is given, which in practice turns it on only for runs of about 24 steps or more.
+* **The step count is the bigger lever on this bench.** Dense DPM-Solver with 12 steps is as good as anything
+  measured, in about the same time as the default sampler. The masks save compute at a given step count; they do not
+  move the quality-per-compute frontier past "use a good solver and few steps" here. They matter where many steps
+  are needed - larger images, harder data, higher quality - which this CPU bench cannot reach.
+
+<!-- FINAL -->
+
 <!-- REMOTE -->
 
 ## Prior work
@@ -422,3 +513,4 @@ Two agents reviewed and tested the first version. Every training result in this 
 | Image routing saw only active tokens at sampling | routing differed from training | cached router inputs for the whole image |
 | FID crashed on SciPy 1.18 | `sqrtm(disp=...)` was removed | plain `sqrtm` with the finiteness fallback |
 | `--compare` baseline was not dense | `reuse` stayed on | baseline keeps only `steps`, `solver`, `guidance_scale` |
+| `evaluate.py --no-fid` dropped its result (found later by a remote sub-agent) | timing runs were not written to `--results` | the result is written in both paths |

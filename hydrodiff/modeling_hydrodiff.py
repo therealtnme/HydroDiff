@@ -479,13 +479,13 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         self,
         labels: torch.Tensor | None = None,
         batch_size: int | None = None,
-        steps: int = 32,
+        steps: int = 16,
         guidance_scale: float = 1.0,
         adaptive: bool = True,
         max_rate: float | None = None,
         warmup: float = 0.25,
-        min_token_steps: int = 16,
-        solver: str = "euler",
+        min_token_steps: int | None = None,
+        solver: str = "dpm2m",
         churn: float = 0.0,
         reuse: float = 0.0,
         reuse_by: str = "uncertainty",
@@ -505,14 +505,16 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         `adaptive=False` every token follows the same schedule.
 
         `min_token_steps` caps the speed-up so that no token takes fewer steps than that: a fast token is denoised on a
-        coarser time grid, and below the step count at which the dense sampler stops improving that costs quality.
-        With the defaults it only binds below 32 steps (16 steps or fewer: no speed-up; 20 steps: 1.36x at most).
-        `reuse` obeys the same floor: a token only skips a step while it can still be run `min_token_steps` times.
+        coarser time grid, and below the step count at which the dense sampler stops improving that costs quality. The
+        default is 16 for `euler` (16 steps or fewer: no speed-up; 20 steps: 1.36x at most; 32 steps: not binding)
+        and 10 for `dpm2m`, whose second-order steps tolerate a coarser grid (16 steps: the full 2x).
+        `reuse` obeys a floor too: a token only skips a step while it can still be run 16 times (or `min_token_steps`
+        times when that is given) - a reused token's next step is first order, whatever the solver.
 
-        `solver="euler"` is the first-order step; `"dpm2m"` is DPM-Solver++(2M) on the clean-patch estimates, run per
-        token so that every token uses its own step sizes. `churn` > 0 replaces that share of each token's noise with
-        fresh noise every step (first-order solver only), scaled per token by the same uncertainty rank: the tokens the
-        model cannot predict get the most fresh noise.
+        `solver="dpm2m"` (default) is DPM-Solver++(2M) on the clean-patch estimates, run per token so that every token
+        uses its own step sizes; `"euler"` is the first-order step, which did better on briefly trained models.
+        `churn` > 0 replaces that share of each token's noise with fresh noise every step (`euler` only), scaled per
+        token by the same uncertainty rank: the tokens the model cannot predict get the most fresh noise.
 
         `reuse` > 0 widens the update mask: that share of the moving tokens - the surest ones - skips the network in a
         step and moves with its estimate from the step before (never twice in a row, never on its last step);
@@ -525,11 +527,17 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         device = self.device
         if not 0 <= churn <= 1:
             raise ValueError("churn must be in [0, 1]")
+        if churn and solver != "euler":
+            raise ValueError("churn needs solver='euler'")
         if labels is None and cfg.num_classes:
             labels = torch.full((batch_size,), cfg.num_classes, device=device)
         b = labels.shape[0] if labels is not None else batch_size
         n = cfg.num_patches
         max_rate = cfg.max_rate if max_rate is None else max_rate
+        # A reused token's next step is first order (its history has a gap), so reuse keeps the first-order floor
+        reuse_floor = 16 if min_token_steps is None else min_token_steps
+        if min_token_steps is None:
+            min_token_steps = 16 if solver == "euler" else 10
         # A token at speed r takes k0 + (steps - k0) / r steps, k0 being the warmup steps at speed 1
         k0 = max(1, math.ceil(warmup * steps))
         if min_token_steps > k0:
@@ -564,7 +572,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
                 # `min_token_steps` times if every later step computes it)
                 top = max_rate if adaptive else 1.0
                 fewest = torch.ceil((1 - progress) * steps / top - 1e-6).clamp(max=steps - k)  # steps left at top speed
-                candidate = moving & computed & (target < 1) & (evaluations + fewest - 1 >= min_token_steps)
+                candidate = moving & computed & (target < 1) & (evaluations + fewest - 1 >= reuse_floor)
                 skips = (reuse * moving.sum(-1, keepdim=True)).floor()
                 score = rank if reuse_by == "uncertainty" else torch.rand(b, n, device=device, generator=generator)
                 order = torch.where(candidate, score, score + 2).argsort(-1).argsort(-1)

@@ -18,7 +18,7 @@ def load_model(path):
     return model, device
 
 
-def generate(model, device, prompt, count=16, steps=32):
+def generate(model, device, prompt, count=16, steps=16):
     name = prompt.strip().lower()
     if name not in CIFAR10_CLASSES:
         print(f"Unknown class. Choose from: {', '.join(CIFAR10_CLASSES)}")

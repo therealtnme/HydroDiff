@@ -6,7 +6,39 @@ The project explores compute-efficient image generation through a **predicted no
 
 HydroDiff is designed to remain compatible with the Transformers ecosystem (`PreTrainedModel`, `save_pretrained`, `from_pretrained`) while adding dynamic computation to the sampler.
 
-<!-- RESULTS -->
+## Results
+
+Every idea was measured on CIFAR-10 (32x32, class-conditional) with the 3M-parameter `hydrodiff-s`, trained on CPUs for 4,000 and 12,000 steps. Quality is FID against 10,000 training images; compute is the number of token evaluations relative to a dense sampler with the same steps. All tables are in [`test/RESEARCH.md`](test/RESEARCH.md).
+
+| Idea | What was measured | Status |
+| ---- | ----------------- | ------ |
+| Non-binary noise mask (per-token noise level) | The uncertainty head finds unpredictable detail (Spearman 0.53-0.67 against high-frequency energy). It keeps the dense sampler's quality for 11% less compute at 16 steps and 16% less at 32 steps. On briefly trained models it was up to 2.3 FID *better* than the dense sampler; on longer-trained models it is level. It needs mixed-level training and enough steps per token. | Default |
+| Binary update mask (only active tokens are computed) | Finished tokens are skipped exactly; the key/value cache costs no measurable quality. With `reuse`, 32-step sampling uses 29-36% less compute at the same quality with DPM-Solver (39-43% less wall-clock time); with Euler on longer-trained models it costs 0.5-2 FID. Choosing the skipped tokens at random works about as well as choosing the surest. | Default (finished tokens); `reuse` is an option |
+| Mixture-of-experts denoiser | No accuracy or speed gain at equal active compute at this scale; per-token routing makes single-image latency 57% worse. | Option, off by default |
+| Per-token fresh noise (`churn`) | No gain; worse when strong. | Dropped (default `0`) |
+| `hetero_start` (new) | Starts mixed-level training at the sampler's warmup; removes most of what mixed-level training costs the plain sampler. | Default |
+| `min_token_steps` (new) | No token may take fewer steps than this (16 with Euler, 10 with DPM-Solver; `reuse` always keeps 16 evaluations); prevents the quality loss of fast tokens on too coarse a time grid. | Default |
+
+### Final model
+
+`hydrodiff-s` with the default configuration, trained for 12,000 steps (92 minutes on 4 CPU threads). Sampling speed was measured alone on the machine (4 threads, batches of 250).
+
+| Sampler (DPM-Solver) | FID (2,000 samples, 2 seeds) | Compute | ms / image |
+| -------------------- | ---------------------------- | ------- | ---------- |
+| dense, 16 steps | 41.59 / 40.39 | 1.00 | 42 |
+| **noise mask, 16 steps (default `generate()`)** | **41.45 / 40.04** | **0.89** | **34** |
+| dense, 32 steps | 42.66 | 1.00 | 82 |
+| noise mask + `reuse=0.25`, 32 steps | 41.34 | 0.71 | 50 |
+| dense, 12 steps | 41.72 | 1.00 | 33 |
+
+With 5,000 samples and Euler at 32 steps, the noise mask gives FID 33.52 against 33.43 for the dense sampler, for 84% of the compute.
+
+![100 samples from the final model, one class per column](test/figures/samples.png)
+
+Two limits matter for the speed claims:
+
+* On this bench every sampler reaches its best quality at 12-16 steps. The masks save compute at a given step count; they do not beat simply using a good solver with few steps (dense DPM-Solver with 12 steps is as good and as fast as the default sampler). They pay off where many steps are needed - larger images, harder data - which this CPU bench cannot reach.
+* The savings are real wall-clock savings when images are generated in batches (the compute per step is large). For a single 32x32 image on a CPU, each step is dominated by fixed costs, and the masks do not reduce latency.
 
 ## Features
 
@@ -105,14 +137,15 @@ At the scale tested (3M active parameters, CPU), the experts gave no measurable 
 
 `generate` supports:
 
+* `solver="dpm2m"` (default): DPM-Solver++(2M), run **per token** so that every token uses its own step sizes
 * `solver="euler"`: first-order step on the clean-patch estimate (DDIM form)
-* `solver="dpm2m"`: DPM-Solver++(2M), run **per token** so that every token uses its own step sizes
+* `steps` (default `16`)
 * `guidance_scale`: classifier-free guidance
-* `adaptive`, `max_rate`, `warmup`: the noise mask
+* `adaptive`, `max_rate`, `warmup`, `min_token_steps`: the noise mask
 * `reuse`, `reuse_by`, `skip_finished`, `refresh_finished`: the update mask
-* `churn`: per-token fresh noise
+* `churn`: per-token fresh noise (Euler only)
 
-On this bench `euler` beats `dpm2m`, and the noise mask with `max_rate=3` keeps its quality at 32 steps for 12% less compute but hurts at 16 steps or fewer.
+DPM-Solver is the default because, on trained models, it is as good with 12-16 steps as Euler with 32, and it tolerates the coarser time grid of a fast token. On very briefly trained models Euler did better. `reuse` is meant for runs of about 24 steps or more; below that the `reuse` floor turns it off.
 
 ## Architecture
 
@@ -190,10 +223,11 @@ can be loaded through the standard Auto API.
 
 ```bash
 bash test/setup_bench.sh                       # packages, CIFAR-10 as .npz, InceptionV3 weights for FID
-python test/train.py --preset hydrodiff-s --steps 4000 --out runs/base
-python test/validate.py runs/base/ema
-python test/evaluate.py --ckpt runs/base/ema --n 2000 --gen steps=32
-python test/evaluate.py --ckpt runs/base/ema --n 2000 --gen steps=32 reuse=0.5
+python test/train.py --preset hydrodiff-s --steps 12000 --threads 4 --out runs/final
+python test/validate.py runs/final/ema
+python test/evaluate.py --ckpt runs/final/ema --n 2000                                  # default sampler
+python test/evaluate.py --ckpt runs/final/ema --n 2000 --gen steps=16 adaptive=false     # dense baseline
+python test/evaluate.py --ckpt runs/final/ema --n 2000 --gen steps=32 reuse=0.25         # both masks
 ```
 
 * `--set key=value` overrides any configuration field.
@@ -271,6 +305,8 @@ Claude implements and tests it
         ▼          Drop or change the idea
    Keep and iterate
 ```
+
+Research and testing ran in parallel through sub-agents: one reviewed the literature, two reviewed and tested the code (they found seven real defects, all fixed before any reported run), and seven remote Claude Code sessions trained and evaluated models in their own containers while the main session ran its own studies.
 
 The measurements, the ideas that were kept and the ideas that were dropped are in [`test/RESEARCH.md`](test/RESEARCH.md).
 
