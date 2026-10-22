@@ -210,11 +210,15 @@ class HydroDiffMoE(HydroDiffMLP):
             if self.top_k > 1:  # with one expert the normalised weight would be exactly 1, and the router untrainable
                 weights = weights / weights.sum(-1, keepdim=True)
             weights = weights.to(x.dtype)
-        out = torch.zeros_like(x)
-        for e in chosen.unique().tolist():
-            row, slot = (chosen == e).nonzero(as_tuple=True)
-            w = weights[row, slot].view(-1, *([1] * (x.ndim - 1)))
-            out.index_add_(0, row, self.expert(e, x[row]) * w)
+        experts = chosen.unique().tolist()
+        if len(experts) == 1 and self.top_k == 1:  # one expert for everything (e.g. every token at the same noise level)
+            out = self.expert(experts[0], x) * weights.view(-1, *([1] * (x.ndim - 1)))
+        else:
+            out = torch.zeros_like(x)
+            for e in experts:
+                row, slot = (chosen == e).nonzero(as_tuple=True)
+                w = weights[row, slot].view(-1, *([1] * (x.ndim - 1)))
+                out.index_add_(0, row, self.expert(e, x[row]) * w)
         if self.training and self.routing != "time":
             with torch.no_grad():
                 load = torch.bincount(chosen.flatten(), minlength=self.num_experts).float()

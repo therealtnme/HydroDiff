@@ -85,6 +85,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=200)
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--eval-every", type=int, default=500)
+    ap.add_argument("--save-every", type=int, default=250, help="full training state for resuming after an interruption")
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", default=None, help="checkpoint dir to continue from (weights only)")
@@ -117,6 +118,19 @@ def main():
     log = open(os.path.join(args.out, "log.jsonl"), "a")
     start, step, seen_loss = time.time(), 0, []
     g = torch.Generator().manual_seed(args.seed)
+    # Re-running the same command continues from the last saved state (weights, EMA, optimizers, step and RNG)
+    state_path = os.path.join(args.out, "state.pt")
+    if os.path.exists(state_path):
+        state = torch.load(state_path, weights_only=False)
+        model.load_state_dict(state["model"])
+        ema.load_state_dict(state["ema"])
+        for opt, opt_state in zip(optimizers, state["optimizers"]):
+            opt.load_state_dict(opt_state)
+        step = state["step"]
+        g.set_state(state["generator"])
+        torch.set_rng_state(state["torch_rng"])
+        start -= state["elapsed"]
+        print(f"resumed at step {step}", flush=True)
     while True:
         elapsed = time.time() - start
         if total_steps and step >= total_steps:
@@ -155,6 +169,11 @@ def main():
             log.write(json.dumps(rec) + "\n")
             log.flush()
             ema.save_pretrained(os.path.join(args.out, "ema"))
+        if step % args.save_every == 0:
+            state = dict(model=model.state_dict(), ema=ema.state_dict(), optimizers=[o.state_dict() for o in optimizers],
+                         step=step, generator=g.get_state(), torch_rng=torch.get_rng_state(), elapsed=time.time() - start)
+            torch.save(state, state_path + ".tmp")
+            os.replace(state_path + ".tmp", state_path)
     uniform, mixed = validation_loss(ema, val_images, val_labels)
     rec = dict(step=step, minutes=(time.time() - start) / 60, final=True, val_uniform=uniform, val_mixed=mixed,
                params=params, imgs_per_sec=step * args.batch / (time.time() - start))
