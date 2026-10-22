@@ -429,3 +429,15 @@ def test_reuse_keeps_min_token_steps_evaluations(make_model):
     assert evaluations.min() >= 16
     unguarded = sample(model, steps=24, min_token_steps=0, max_rate=2.0, reuse=0.5, return_masks=True)
     assert unguarded.update_masks.sum(0).min() < 16 and out.compute > unguarded.compute
+
+
+def test_guidance_paths_agree(make_model):
+    """Batched classifier-free guidance equals the separate-pass path (a skipped block that does not exist)."""
+    model = make_model()
+    batched = sample(model, guidance_scale=2.0)
+    separate = sample(model, guidance_scale=2.0, uncond_skip_layers=(99,))
+    torch.testing.assert_close(batched.images, separate.images)
+    weaker = sample(model, guidance_scale=2.0, uncond_skip_layers=(1,))
+    assert not torch.allclose(weaker.images, batched.images)
+    outside = sample(model, guidance_scale=2.0, guidance_interval=(2.0, 3.0))  # no token ever inside
+    torch.testing.assert_close(outside.images, sample(model).images)

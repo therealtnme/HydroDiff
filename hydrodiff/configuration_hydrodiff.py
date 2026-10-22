@@ -50,6 +50,8 @@ class HydroDiffConfig(PreTrainedConfig):
         prediction_type (`str`): `"x"` (the network outputs the clean patch, the loss is on velocity) or `"v"`
             (the network outputs the velocity). Pixel patches are high-dimensional, which favours `"x"`.
         time_shift (`float`): Resolution shift of the noise schedule, `t' = s t / (1 + (s - 1) t)`.
+        timestep_mean (`float`): Mean of the logit-normal training noise level (0: centred on t = 0.5; positive
+            values train more at high noise, as MOSS-Image does).
         hetero_prob (`float`): Fraction of training images whose tokens get different noise levels.
         hetero_start (`float`): Progress (0 = pure noise, 1 = clean) from which those tokens' speeds differ. Matching
             the sampler's `warmup` keeps training on the states the sampler produces and nothing else.
@@ -89,6 +91,7 @@ class HydroDiffConfig(PreTrainedConfig):
 
     prediction_type: str = "x"
     time_shift: float | int = 1.0
+    timestep_mean: float | int = 0.0
     hetero_prob: float | int = 0.25
     hetero_start: float | int = 0.25
     max_rate: float | int = 2.0

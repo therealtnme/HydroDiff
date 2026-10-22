@@ -306,7 +306,8 @@ class HydroDiffOutput(ModelOutput):
 class HydroDiffGenerationOutput(ModelOutput):
     """
     images: generated images in [-1, 1].
-    compute: token evaluations divided by `steps * tokens` (what a dense sampler with the same steps would spend).
+    compute: token evaluations divided by `steps * tokens` (what a dense sampler with the same steps would spend);
+        guidance adds one reference evaluation per token evaluation on top.
     noise_masks: optional per-step noise levels of every token, (steps + 1, batch, tokens).
     update_masks: optional per-step binary masks of computed tokens, (steps, batch, tokens).
     """
@@ -367,12 +368,14 @@ class HydroDiffModel(HydroDiffPreTrainedModel):
         labels: torch.Tensor | None = None,
         index: torch.Tensor | None = None,
         cache: HydroDiffTokenCache | None = None,
+        skip_layers: tuple[int, ...] = (),
     ) -> HydroDiffModelOutput:
         """
         noisy_tokens: (batch, active, patch_dim) - all tokens, or only the active ones when `index` is given.
         timesteps: (batch, active) per-token noise levels in [0, 1].
         index: (batch, active) token positions of the active tokens. Tokens not listed are not computed; with a
             `cache` they still serve as keys and values from the last step that computed them.
+        skip_layers: blocks to leave out (a deliberately weakened model, used as the reference of guidance).
         """
         cos, sin = rotary_2d(self.config, noisy_tokens.device)
         if index is not None:
@@ -383,7 +386,8 @@ class HydroDiffModel(HydroDiffPreTrainedModel):
         skips = []
         for i, layer in enumerate(self.layers):
             skip = skips.pop() if layer.skip_proj is not None else None
-            hidden_states = layer(hidden_states, modulation, cos, sin, timesteps, index, cache, skip)
+            if i not in skip_layers:
+                hidden_states = layer(hidden_states, modulation, cos, sin, timesteps, index, cache, skip)
             if self.config.long_skips and i < len(self.layers) // 2:
                 skips.append(hidden_states)
         hidden_states = self.norm(hidden_states)
@@ -407,13 +411,14 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
 
     def sample_timesteps(self, batch: int, device, generator=None) -> torch.Tensor:
         """
-        Per-token noise levels for training. Each image gets a logit-normal progress `q` (how far denoising has got).
+        Per-token noise levels for training. Each image gets a logit-normal progress `q` (how far denoising has got;
+        `timestep_mean` > 0 moves it towards high noise).
         A `hetero_prob` share of images also gets a per-token speed `r` in [1, max_rate] from progress `hetero_start`
         on, so a token's progress is `q + (r - 1) * (q - hetero_start)`: the states the adaptive sampler produces, where
         confident tokens are ahead of (cleaner than) the rest once its warmup is over.
         """
         cfg, n = self.config, self.config.num_patches
-        q = 1 - torch.sigmoid(torch.randn(batch, 1, device=device, generator=generator))
+        q = 1 - torch.sigmoid(torch.randn(batch, 1, device=device, generator=generator) + cfg.timestep_mean)
         rate = 1 + (cfg.max_rate - 1) * torch.rand(batch, n, device=device, generator=generator)
         hetero = torch.rand(batch, 1, device=device, generator=generator) < cfg.hetero_prob
         rate = torch.where(hetero, rate, torch.ones_like(rate))
@@ -464,15 +469,37 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
 
     # ---------------------------------------------------------------------------------------------------- sampling
 
-    def _velocity_and_error(self, x, t, labels, index, cache, guidance_scale):
-        if guidance_scale == 1 or labels is None:
-            out = self.model(x, t, labels, index, cache)
+    def _velocity_and_error(self, x, t, labels, index, caches, guidance):
+        """
+        The velocity of the active tokens, with guidance: `v_ref + scale * (v - v_ref)`. The reference is the
+        unconditional model (classifier-free guidance), optionally with some blocks left out, or a weaker model with the
+        same label (autoguidance). Outside `interval` (per-token noise levels) the plain conditional velocity is used.
+        """
+        scale, interval, skip_layers, guide_model = guidance
+        if scale == 1 or (labels is None and guide_model is None):
+            out = self.model(x, t, labels, index, caches[0])
             return self.velocity(out.prediction, x, t), out.log_error
-        null = torch.full_like(labels, self.config.num_classes)
-        both = lambda z: None if z is None else torch.cat([z, z])
-        out = self.model(both(x), both(t), torch.cat([labels, null]), both(index), cache)
-        v_cond, v_null = self.velocity(out.prediction, both(x), both(t)).chunk(2)
-        return v_null + guidance_scale * (v_cond - v_null), out.log_error.chunk(2)[0]
+        if guide_model is None and not skip_layers:  # plain classifier-free guidance: one batched pass
+            null = torch.full_like(labels, self.config.num_classes)
+            both = lambda z: None if z is None else torch.cat([z, z])
+            out = self.model(both(x), both(t), torch.cat([labels, null]), both(index), caches[0])
+            v, v_ref = self.velocity(out.prediction, both(x), both(t)).chunk(2)
+            log_error = out.log_error.chunk(2)[0]
+        else:
+            out = self.model(x, t, labels, index, caches[0])
+            v, log_error = self.velocity(out.prediction, x, t), out.log_error
+            if guide_model is not None:
+                ref = guide_model.model(x, t, labels, index, caches[1])
+                v_ref = guide_model.velocity(ref.prediction, x, t)
+            else:
+                null = torch.full_like(labels, self.config.num_classes)
+                ref = self.model(x, t, null, index, caches[1], skip_layers=skip_layers)
+                v_ref = self.velocity(ref.prediction, x, t)
+        guided = v_ref + scale * (v - v_ref)
+        if interval is not None:
+            inside = ((t >= interval[0]) & (t <= interval[1]))[..., None]
+            guided = torch.where(inside, guided, v)
+        return guided, log_error
 
     @torch.no_grad()
     def generate(
@@ -487,6 +514,10 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         min_token_steps: int | None = None,
         solver: str = "dpm2m",
         churn: float = 0.0,
+        guidance_interval: tuple[float, float] | None = None,
+        uncond_skip_layers: tuple[int, ...] = (),
+        guide_model: "HydroDiffForImageGeneration | None" = None,
+        time_shift: float | None = None,
         reuse: float = 0.0,
         reuse_by: str = "uncertainty",
         skip_finished: bool = True,
@@ -515,6 +546,11 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         uses its own step sizes; `"euler"` is the first-order step, which did better on briefly trained models.
         `churn` > 0 replaces that share of each token's noise with fresh noise every step (`euler` only), scaled per
         token by the same uncertainty rank: the tokens the model cannot predict get the most fresh noise.
+
+        Guidance (`guidance_scale` > 1) mixes in a reference velocity: the unconditional model (classifier-free
+        guidance), the unconditional model without the blocks in `uncond_skip_layers` (as MOSS-Image does), or a
+        weaker `guide_model` given the same labels (autoguidance). `guidance_interval=(lo, hi)` applies it only to
+        tokens whose noise level is in that range. `time_shift` overrides the configuration's schedule shift.
 
         `reuse` > 0 widens the update mask: that share of the moving tokens - the surest ones - skips the network in a
         step and moves with its estimate from the step before (never twice in a row, never on its last step);
@@ -550,8 +586,10 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         computed = torch.ones(b, n, dtype=torch.bool, device=device)
         evaluations = torch.zeros(b, n, device=device)  # steps in which each token was run while it still had noise
         just_finished = torch.zeros(b, n, dtype=torch.bool, device=device)
-        cache = HydroDiffTokenCache()
-        to_t = lambda q: shift_time(1 - q, cfg.time_shift)
+        caches = (HydroDiffTokenCache(), HydroDiffTokenCache())
+        guidance = (guidance_scale, guidance_interval, tuple(uncond_skip_layers), guide_model)
+        shift = cfg.time_shift if time_shift is None else time_shift
+        to_t = lambda q: shift_time(1 - q, shift)
         evaluated, noise_masks, update_masks = 0, [to_t(progress)], []
         for k in range(steps):
             moving = progress < 1
@@ -584,7 +622,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
                 index = (need.float() + torch.rand(b, n, device=device, generator=generator) * 0.5).topk(count, -1).indices
                 index = index.sort(-1).values
             x_a, t_a = gather_tokens(x, index), to_t(gather_tokens(progress, index))
-            v, err = self._velocity_and_error(x_a, t_a.to(x.dtype), labels, index, cache, guidance_scale)
+            v, err = self._velocity_and_error(x_a, t_a.to(x.dtype), labels, index, caches, guidance)
             x0 = scatter_tokens(x0, index, x_a - t_a[..., None].to(x.dtype) * v)
             log_error = scatter_tokens(log_error, index, err.float())
             computed = scatter_tokens(torch.zeros_like(need), index, torch.ones_like(t_a, dtype=torch.bool))
