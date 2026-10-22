@@ -184,15 +184,16 @@ Replacing part of the noise of unpredictable tokens with fresh noise does not he
 "how much noise where" idea works as a per-token noise *level* (section 2), not as per-token noise *injection*.
 `churn` stays available but defaults to 0.
 
-## 5. Solver: Euler beats DPM-Solver++(2M) here
+## 5. Solver on the briefly trained model: Euler beats DPM-Solver++(2M)
 
 | base model, dense | 8 steps | 16 steps | 32 steps |
 | --- | --- | --- | --- |
 | Euler | 54.87 | 51.99 | 51.96 |
 | DPM-Solver++(2M) | 55.53 | 53.44 | 53.76 / 52.71 |
 
-With a small, briefly trained clean-patch predictor the second-order extrapolation does not pay off, so `euler` stays
-the default; `dpm2m` stays available.
+With a small, briefly trained clean-patch predictor the second-order extrapolation does not pay off. This reverses
+with longer training (sections 9 and 10), where DPM-Solver is as good with 12-16 steps as Euler with 32 and is the
+better partner for the masks - so `dpm2m` became the default; use `euler` for briefly trained models.
 
 ## 6. Mixture-of-experts denoiser
 
