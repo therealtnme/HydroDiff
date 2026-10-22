@@ -63,7 +63,7 @@ def main():
     print(f"|---|---|---|---|{'---|' if args.compare else ''}")
     for r in rows:
         extra = f" {r.get('psnr_vs_dense', '')} |" if args.compare else ""
-        print(f"| {r['tag']} | {r['fid']} | {r['compute']} | {r['ms_per_image']} |{extra}")
+        print(f"| {r['tag']} | {r.get('fid', '-')} | {r['compute']} | {r['ms_per_image']} |{extra}")
 
 
 if __name__ == "__main__":

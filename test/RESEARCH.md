@@ -18,7 +18,176 @@ This file records what was tried, what was measured, and what was kept or droppe
 * Speed: `compute` is the number of token evaluations divided by `steps * tokens` (what a dense sampler spends);
   `ms / image` is the measured CPU wall-clock time.
 
-<!-- RESULTS -->
+FID noise: the same setting with a different sampling seed moved by 0.6-1.2 FID at 2,000 samples (51.99 / 51.36,
+51.96 / 51.05, 49.27 / 48.09, 53.76 / 52.71). Every setting uses the same starting noise for the same seed, so
+differences between settings are paired and somewhat less noisy than that, but differences under about 1 FID are not
+evidence of anything.
+
+<!-- SUMMARY -->
+
+## 1. Mixed noise levels in training (`hetero_prob`)
+
+The adaptive sampler puts tokens at different noise levels, so the model must be trained on such states. `base` trains
+half of its images that way (`hetero_prob=0.5`, token speeds in [1, 2]); `nohetero` trains only on one level per image.
+
+| Model | v_uniform | v_mixed | x0_mse t<0.1 | t 0.1-0.3 | t 0.3-0.6 | t 0.6-1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| base (`hetero_prob=0.5`) | **0.1385** | **0.1314** | **0.00077** | **0.00577** | 0.02117 | 0.11307 |
+| nohetero (`hetero_prob=0`) | 0.1444 | 0.1577 | 0.00096 | 0.00583 | 0.02115 | **0.11054** |
+
+Mixed-level training makes the model better on mixed states (as it must) and 20% better at low noise, where the
+cleaner neighbours help. It is 2.3% worse at high noise, and high noise decides the global structure that FID sees:
+
+| FID (2,000 samples), Euler | 8 steps | 12 steps | 16 steps | 32 steps |
+| --- | --- | --- | --- | --- |
+| nohetero, dense sampler | **52.09** | **51.17** | **50.79** | **49.27** / 48.09 |
+| base, dense sampler | 54.87 | 52.76 | 51.99 / 51.36 | 51.96 / 51.05 |
+
+## 2. Noise mask (per-token speed from the uncertainty head)
+
+### What the mask sees
+
+`test/mask_analysis.py` ranks each token's predicted error against the detail of its clean patch (500 test images,
+Spearman correlation per image, averaged):
+
+| Noise level | vs high-pass energy | vs pixel standard deviation |
+| --- | --- | --- |
+| t = 0.3 | 0.67 | 0.39 |
+| t = 0.6 | 0.57 | 0.33 |
+| t = 0.9 | 0.25 | 0.12 |
+
+The head finds the fine, unpredictable detail - the user's "fire, grain, dust, leaves, cracks" - not just edges or
+contrast, and it does so long before the detail is visible (t = 0.6). In generated images, flat backgrounds and sky
+finish first and objects and texture finish last:
+
+![Generated images (top) and the step at which each token finished (bottom: dark = first, bright = last)](figures/noise_mask.png)
+
+### Accuracy and compute
+
+On the model trained for it (`base`), the noise mask is better than the dense sampler at every step count from 12 up,
+with less compute, and keeps improving where the dense sampler has stopped:
+
+| Euler, base model | FID dense | FID noise mask | compute of the noise mask |
+| --- | --- | --- | --- |
+| 8 steps | **54.87** | 55.85 | 0.96 |
+| 10 steps | - | 53.44 | 0.94 |
+| 12 steps | 52.76 | **52.44** | 0.91 |
+| 16 steps | 51.99 / 51.36 | **51.03** | 0.89 |
+| 20 steps | - | **50.33** | 0.87 |
+| 32 steps | 51.96 / 51.05 | **49.67 / 48.91** | 0.84 |
+
+At 32 steps the gain is 2.3 and 2.1 FID on two sampling seeds. Below about 10 steps the warmup leaves too few steps for
+tokens to separate, and the mask neither helps nor saves compute.
+
+On a model **not** trained on mixed states the mask hurts: `nohetero` goes from 49.27 to 50.20 (Euler, 32 steps) and
+from 50.13 to 52.92 (DPM-Solver, 32 steps).
+
+**Net result.** Mixed-level training costs about as much FID with the dense sampler (2-3) as the noise mask then wins
+back, so at this budget `base` + noise mask (49.67 / 48.91 at 0.84 compute) is level with `nohetero` + dense sampler
+(49.27 / 48.09 at full compute): the same quality for 16% less compute, not better quality. Sections 6-8 test whether
+that training cost can be removed.
+
+### Sampler settings
+
+| Setting (DPM-Solver, 32 steps, base model) | FID | compute |
+| --- | --- | --- |
+| noise mask, `warmup=0.25` (default) | 53.08 | 0.84 |
+| `warmup=0.1` | 53.08 | 0.81 |
+| `warmup=0.5` | 53.67 | 0.91 |
+| `max_rate=3` (trained with 2) | 50.84 | 0.74 |
+| Euler, `max_rate=3` | 49.58 | 0.74 |
+| Euler, `max_rate=3`, 16 steps | 52.24 (2: 51.03) | 0.79 |
+| Euler, `max_rate=3`, 12 steps | 54.43 (2: 52.44) | 0.82 |
+
+A wider speed spread at sampling (`max_rate=3`) keeps the quality at 32 steps for 12% less compute, but hurts at 12-16
+steps, where there are too few steps to absorb a token that runs three times as fast.
+
+## 3. Update mask
+
+### Skipping finished tokens: the key/value cache is free
+
+| DPM-Solver, 32 steps, base model | FID | compute |
+| --- | --- | --- |
+| noise mask, finished tokens skipped (cache) | 53.08 | 0.84 |
+| noise mask, every token computed every step (`skip_finished=False`) | 52.94 | 1.00 |
+| noise mask, no `t = 0` refresh of finished tokens | 53.19 | 0.81 |
+
+Not computing finished tokens - they attend only through cached keys and values - costs nothing measurable. The `t = 0`
+refresh (one more evaluation per finished token) does not measurably help either.
+
+### Reusing the surest tokens' estimates (`reuse`)
+
+`reuse` takes the surest moving tokens out of a step (they move with their previous clean estimate). It needs no
+special training, because the tokens stay on their own clocks:
+
+| Euler, 32 steps | FID | compute | ms / image |
+| --- | --- | --- | --- |
+| nohetero, dense | 49.27 / 48.09 | 1.00 | 252 |
+| nohetero, `reuse=0.25` | 48.24 | 0.82 | 217 |
+| nohetero, `reuse=0.5` | 48.81 | **0.64** | **151** |
+| nohetero, `reuse=0.5`, DPM-Solver | 48.49 | 0.64 | 158 |
+| nohetero, `reuse=0.25`, DPM-Solver | **47.63** | 0.82 | 221 |
+| base, dense | 51.96 / 51.05 | 1.00 | 233 |
+| base, noise mask | 49.67 / 48.91 | 0.84 | 202 |
+| base, noise mask + `reuse=0.25` | 50.02 | 0.71 | 173 |
+| base, noise mask + `reuse=0.5` | 50.76 | 0.60 | 146 |
+| base, noise mask + `reuse=0.5` + `max_rate=3` | 51.88 | 0.55 | 129 |
+| base, `reuse=0.5` only | 51.65 | 0.64 | 152 |
+
+The update mask is the clearest speed win: it saves a third of the compute (1.6-1.7x less wall-clock time) at the same FID.
+At few steps it costs quality instead: base, Euler 16 steps, `reuse=0.25` gives 53.04 (compute 0.76) against 51.03 for
+the noise mask alone (0.89) - no better than simply taking fewer steps.
+
+(`ms / image` was measured with four evaluations sharing the CPU, one thread each; it tracks `compute` closely.)
+
+## 4. Fresh noise per token (`churn`) - dropped
+
+| Euler, 32 steps, base model | FID |
+| --- | --- |
+| noise mask | 49.67 |
+| noise mask, `churn=0.2` | 49.68 |
+| noise mask, `churn=0.5` | 52.19 |
+| dense, `churn=0.2` | 51.93 (no churn: 51.96) |
+
+Replacing part of the noise of unpredictable tokens with fresh noise does not help and hurts when strong. The
+"how much noise where" idea works as a per-token noise *level* (section 2), not as per-token noise *injection*.
+`churn` stays available but defaults to 0.
+
+## 5. Solver: Euler beats DPM-Solver++(2M) here
+
+| base model, dense | 8 steps | 16 steps | 32 steps |
+| --- | --- | --- | --- |
+| Euler | 54.87 | 51.99 | 51.96 |
+| DPM-Solver++(2M) | 55.53 | 53.44 | 53.76 / 52.71 |
+
+With a small, briefly trained clean-patch predictor the second-order extrapolation does not pay off, so `euler` stays
+the default; `dpm2m` stays available.
+
+## 6. Mixture-of-experts denoiser
+
+All four models have the same active parameters per token: the MoE layers (blocks 1-5) hold one shared expert of 256
+and eight routed experts of 256 with one active, against one dense MLP of 512. Sampling speed was measured alone on the
+machine (4 threads); FID with DPM-Solver, 32 steps, 2,000 samples.
+
+| Model | Params | Train img/s | v_uniform | v_mixed | FID dense | FID noise mask | ms / image (batch 250) dense / mask | Latency, batch 1 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| dense | 3.07M | **31.8** | 0.1383 | 0.1313 | 53.12 | 51.79 | 93 / 79 | **377 ms** |
+| MoE, token routing | 8.23M | 22.3 | **0.1380** | **0.1311** | 52.80 | 51.02 | 90 / 85 | 593 ms |
+| MoE, noise-level routing (`time`) | 8.23M | 22.4 | 0.1386 | 0.1315 | 49.86 | 51.09 | 92 / 81 | 379 ms |
+| MoE, image routing | 8.23M | 22.9 | 0.1381 | 0.1312 | 53.89 | 51.89 | 92 / **74** | 386 ms |
+
+At equal active compute the experts do not make the model more accurate at this scale - the validation losses are
+within 0.3% of each other and the FID differences are inconsistent between the two samplers (noise-level routing is
+best with the dense sampler and level with the others under the noise mask). They do not make it faster either:
+training is 30% slower (expert dispatch on a CPU), batch sampling costs the same, and per-token routing makes
+single-image latency 57% worse, because every expert is a separate small matrix product. Noise-level and image routing
+keep the latency of the dense model, since at batch 1 nearly every token goes to the same expert in a step.
+
+This matches the literature: token-level MoE wins at equal active FLOPs from B scale up, with long training on
+accelerators. `num_experts=0` (dense) stays the default; the three routing modes stay available, and `time` routing is
+the one to try first at a larger scale (no router, no balancing, no latency cost).
+
+<!-- REMOTE -->
 
 ## Prior work
 

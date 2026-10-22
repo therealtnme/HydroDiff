@@ -117,13 +117,11 @@ def main():
         from torchvision.utils import save_image
 
         save_image((images[:100] + 1) / 2, args.save_grid, nrow=10)
-    if args.no_fid:
-        print(json.dumps(result), flush=True)
-        return
-    net = inception()
-    ref = reference_stats(args.ref, args.data, args.ref_size, net)
-    images = ((images + 1) * 127.5).round() / 255  # quantised like the reference images
-    result["fid"] = round(frechet(features(net, images), ref), 3)
+    if not args.no_fid:
+        net = inception()
+        ref = reference_stats(args.ref, args.data, args.ref_size, net)
+        images = ((images + 1) * 127.5).round() / 255  # quantised like the reference images
+        result["fid"] = round(frechet(features(net, images), ref), 3)
     print(json.dumps(result), flush=True)
     if args.results:
         with open(args.results, "a") as f:

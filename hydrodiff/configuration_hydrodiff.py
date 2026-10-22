@@ -86,7 +86,7 @@ class HydroDiffConfig(PreTrainedConfig):
     prediction_type: str = "x"
     time_shift: float | int = 1.0
     hetero_prob: float | int = 0.5
-    hetero_start: float | int = 0.0
+    hetero_start: float | int = 0.25
     max_rate: float | int = 2.0
     uncertainty_loss_weight: float | int = 0.1
 

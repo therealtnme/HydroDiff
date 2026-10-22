@@ -487,6 +487,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         solver: str = "euler",
         churn: float = 0.0,
         reuse: float = 0.0,
+        reuse_by: str = "uncertainty",
         skip_finished: bool = True,
         refresh_finished: bool = True,
         generator: torch.Generator | None = None,
@@ -508,7 +509,8 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         model cannot predict get the most fresh noise.
 
         `reuse` > 0 widens the update mask: that share of the moving tokens - the surest ones - skips the network in a
-        step and moves with its estimate from the step before (never twice in a row, never on its last step).
+        step and moves with its estimate from the step before (never twice in a row, never on its last step);
+        `reuse_by="random"` picks those tokens at random instead (a control for the predicted mask).
         `refresh_finished` runs a token once more at `t = 0` in the step after it finishes, so that the cache holds it as
         clean context - what the model saw in training - rather than its last noisy state. `skip_finished=False` computes
         every token in every step (no speed-up; for measuring what the key/value cache costs).
@@ -550,7 +552,8 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
                 # row, and never for the step that finishes them)
                 candidate = moving & computed & (target < 1)
                 skips = (reuse * moving.sum(-1, keepdim=True)).floor()
-                order = torch.where(candidate, rank, rank + 2).argsort(-1).argsort(-1)
+                score = rank if reuse_by == "uncertainty" else torch.rand(b, n, device=device, generator=generator)
+                order = torch.where(candidate, score, score + 2).argsort(-1).argsort(-1)
                 need &= ~(candidate & (order < skips))
             count = int(need.sum(-1).max())
             if k == 0 or count == n or not skip_finished:
