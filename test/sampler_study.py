@@ -5,8 +5,8 @@ Runs a list of sampler settings through test/evaluate.py in parallel and prints 
         "dense-euler-32: steps=32 adaptive=false" \
         "adaptive-32: steps=32 adaptive=true max_rate=2"
 
-Each setting is `name: key=value ...` (passed to `generate`). Settings already in the results file (same name, checkpoint
-and n) are skipped, so a study can be extended and re-run.
+Each setting is `name: key=value ...` (passed to `generate`; `seed=N` sets the sampling seed instead). Settings already in
+the results file (same name, checkpoint and n) are skipped, so a study can be extended and re-run.
 """
 
 import argparse
@@ -19,10 +19,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 def run(spec: str, args) -> dict | None:
     name, _, gen = spec.partition(":")
+    seed = [kv.split("=", 1)[1] for kv in gen.split() if kv.startswith("seed=")]
+    gen = " ".join(kv for kv in gen.split() if not kv.startswith("seed="))
     cmd = [
         sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "evaluate.py"),
         "--ckpt", args.ckpt, "--n", str(args.n), "--threads", str(args.threads), "--tag", name.strip(),
-        "--results", args.results, "--gen", *gen.split(),
+        "--results", args.results, "--seed", seed[0] if seed else "0", "--gen", *gen.split(),
     ]
     if args.compare:
         cmd.append("--compare")

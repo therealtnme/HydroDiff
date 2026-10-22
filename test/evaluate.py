@@ -97,6 +97,7 @@ def main():
     ap.add_argument("--save-grid", default=None, help="write the first 100 samples as a PNG grid")
     ap.add_argument("--results", default=None, help="append the result as a JSON line to this file")
     ap.add_argument("--tag", default="")
+    ap.add_argument("--no-fid", action="store_true", help="only time the sampler")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
 
@@ -116,6 +117,9 @@ def main():
         from torchvision.utils import save_image
 
         save_image((images[:100] + 1) / 2, args.save_grid, nrow=10)
+    if args.no_fid:
+        print(json.dumps(result), flush=True)
+        return
     net = inception()
     ref = reference_stats(args.ref, args.data, args.ref_size, net)
     images = ((images + 1) * 127.5).round() / 255  # quantised like the reference images
