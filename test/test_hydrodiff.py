@@ -402,7 +402,7 @@ def test_perfect_x_prediction_has_zero_loss_at_every_t(make_model):
     pixels = torch.rand(2, 3, 16, 16) * 2 - 1
     timesteps = torch.linspace(0.001, 1, cfg.num_patches).expand(2, -1).contiguous()
     perfect = patchify(pixels, cfg.patch_size)
-    model.model.forward = lambda x, t, labels=None, index=None, cache=None: type(
+    model.model.forward = lambda x, t, labels=None, index=None, cache=None, **kwargs: type(
         "Out", (), {"prediction": perfect, "log_error": torch.zeros(t.shape)}
     )()
     out = model(pixels, torch.tensor([0, 1]), timesteps=timesteps)
@@ -441,3 +441,44 @@ def test_guidance_paths_agree(make_model):
     assert not torch.allclose(weaker.images, batched.images)
     outside = sample(model, guidance_scale=2.0, guidance_interval=(2.0, 3.0))  # no token ever inside
     torch.testing.assert_close(outside.images, sample(model).images)
+
+
+def test_quality_training_options_are_finite_and_train_their_parts(make_model):
+    """Self-conditioning, contrastive flow matching and the dispersive loss give a finite loss and train the new parts."""
+    model = make_model(self_condition=True, contrastive_weight=0.05, dispersive_weight=0.25).train()
+    pixels, labels = torch.rand(4, 3, 16, 16) * 2 - 1, torch.tensor([0, 1, 2, 3])
+    torch.manual_seed(0)
+    for _ in range(4):  # the self-conditioning pass runs on half of the steps
+        loss = model(pixels, labels).loss
+        assert torch.isfinite(loss)
+        loss.backward()
+    assert model.model.self_cond_embed.weight.grad.abs().sum() > 0
+
+
+def test_self_conditioned_active_tokens_match_full_run(make_model):
+    """The previous estimate is gathered with the active tokens, so the active path still equals the full run."""
+    model = make_model(self_condition=True)
+    cfg = model.config
+    g = torch.Generator().manual_seed(0)
+    x, t = torch.randn(2, cfg.num_patches, cfg.patch_dim, generator=g), torch.rand(2, cfg.num_patches, generator=g)
+    estimate = torch.randn(x.shape, generator=g)
+    index, labels, cache = torch.tensor([[0, 5, 9], [3, 4, 15]]), torch.tensor([1, 2]), HydroDiffTokenCache()
+    with torch.no_grad():
+        full = model.model(x, t, labels, None, cache, self_cond=estimate)
+        active = model.model(
+            gather_tokens(x, index), gather_tokens(t, index), labels, index, cache, self_cond=gather_tokens(estimate, index)
+        )
+        plain = model.model(x, t, labels)
+    torch.testing.assert_close(active.prediction, gather_tokens(full.prediction, index), atol=1e-5, rtol=0)
+    assert (plain.prediction - full.prediction).abs().max() > 1e-3
+    assert torch.isfinite(sample(model).images).all()
+
+
+def test_guidance_schedule_and_cfg_zero(make_model):
+    model = make_model()
+    constant = sample(model, guidance_scale=2.0)
+    linear = sample(model, guidance_scale=2.0, guidance_schedule="linear")
+    zero = sample(model, guidance_scale=2.0, cfg_zero=True)
+    for out in (linear, zero):
+        assert torch.isfinite(out.images).all() and not torch.allclose(out.images, constant.images)
+    torch.testing.assert_close(sample(model, cfg_zero=True).images, sample(model).images)  # no guidance: no change

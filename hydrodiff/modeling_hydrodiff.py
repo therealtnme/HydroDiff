@@ -13,6 +13,7 @@ from .configuration_hydrodiff import HydroDiffConfig
 
 
 X_PRED_MIN_T = 0.05  # x-prediction divides by t to get a velocity; training clips t here (as in JiT)
+DISPERSIVE_TEMPERATURE = 0.5
 TIME_FREQUENCIES = 256
 
 
@@ -291,6 +292,7 @@ class HydroDiffModelOutput(ModelOutput):
 
     prediction: torch.Tensor | None = None
     log_error: torch.Tensor | None = None
+    features: torch.Tensor | None = None
 
 
 @dataclass
@@ -353,6 +355,10 @@ class HydroDiffModel(HydroDiffPreTrainedModel):
     def __init__(self, config: HydroDiffConfig):
         super().__init__(config)
         self.patch_embed = nn.Linear(config.patch_dim, config.hidden_size)
+        # Self-conditioning: the previous clean-patch estimate enters through its own (zero-initialised) projection
+        self.self_cond_embed = nn.Linear(config.patch_dim, config.hidden_size, bias=False) if config.self_condition else None
+        if self.self_cond_embed is not None:
+            self.self_cond_embed.zero_init = True
         self.conditioning = HydroDiffConditioning(config)
         self.layers = nn.ModuleList([HydroDiffBlock(config, i) for i in range(config.num_hidden_layers)])
         self.norm = HydroDiffRMSNorm(config.hidden_size, config.rms_norm_eps, affine=False)
@@ -369,6 +375,7 @@ class HydroDiffModel(HydroDiffPreTrainedModel):
         index: torch.Tensor | None = None,
         cache: HydroDiffTokenCache | None = None,
         skip_layers: tuple[int, ...] = (),
+        self_cond: torch.Tensor | None = None,
     ) -> HydroDiffModelOutput:
         """
         noisy_tokens: (batch, active, patch_dim) - all tokens, or only the active ones when `index` is given.
@@ -376,6 +383,7 @@ class HydroDiffModel(HydroDiffPreTrainedModel):
         index: (batch, active) token positions of the active tokens. Tokens not listed are not computed; with a
             `cache` they still serve as keys and values from the last step that computed them.
         skip_layers: blocks to leave out (a deliberately weakened model, used as the reference of guidance).
+        self_cond: the previous clean-patch estimate of the same tokens (`self_condition=True`; None = no estimate).
         """
         cos, sin = rotary_2d(self.config, noisy_tokens.device)
         if index is not None:
@@ -383,17 +391,21 @@ class HydroDiffModel(HydroDiffPreTrainedModel):
         cos, sin = cos.unsqueeze(-3).to(noisy_tokens.dtype), sin.unsqueeze(-3).to(noisy_tokens.dtype)
         modulation, (final_shift, final_scale) = self.conditioning(timesteps, labels)
         hidden_states = self.patch_embed(noisy_tokens)
-        skips = []
+        if self.self_cond_embed is not None and self_cond is not None:
+            hidden_states = hidden_states + self.self_cond_embed(self_cond)
+        skips, features = [], None
         for i, layer in enumerate(self.layers):
             skip = skips.pop() if layer.skip_proj is not None else None
             if i not in skip_layers:
                 hidden_states = layer(hidden_states, modulation, cos, sin, timesteps, index, cache, skip)
             if self.config.long_skips and i < len(self.layers) // 2:
                 skips.append(hidden_states)
+            if i == len(self.layers) // 2 - 1:
+                features = hidden_states.mean(1)  # image-level representation for the dispersive loss
         hidden_states = self.norm(hidden_states)
         log_error = self.uncertainty_head(hidden_states.detach()).squeeze(-1)
         prediction = self.proj_out(hidden_states * (1 + final_scale) + final_shift)
-        return HydroDiffModelOutput(prediction=prediction, log_error=log_error)
+        return HydroDiffModelOutput(prediction=prediction, log_error=log_error, features=features)
 
 
 class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
@@ -445,7 +457,12 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
                 labels = torch.where(drop, torch.full_like(labels, cfg.num_classes), labels)
         t = timesteps[..., None]
         x_t = (1 - t) * x0 + t * noise
-        out = self.model(x_t, timesteps, labels)
+        self_cond = None
+        if cfg.self_condition and self.training and torch.rand(()) < 0.5:
+            with torch.no_grad():  # half the time, condition on the model's own first estimate (Analog Bits)
+                first = self.model(x_t, timesteps, labels).prediction
+                self_cond = first if cfg.prediction_type == "x" else x_t - t * first
+        out = self.model(x_t, timesteps, labels, self_cond=self_cond)
         if cfg.prediction_type == "x":
             # prediction and target share the clipped 1 / t, so a perfect prediction has zero loss at every t
             v_pred = self.velocity(out.prediction, x_t, timesteps, X_PRED_MIN_T)
@@ -462,6 +479,22 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         u = out.log_error
         uncertainty_loss = (((x0_error * torch.exp(-u) + u) * weight).sum() / weight.sum().clamp_min(1))
         loss = denoise_loss + cfg.uncertainty_loss_weight * uncertainty_loss
+        if cfg.contrastive_weight and self.training:
+            # Contrastive flow matching: move away from the target of another image in the batch
+            other = torch.roll(torch.arange(b, device=x0.device), 1)
+            if cfg.prediction_type == "x":
+                v_other = (x_t - x0[other]) / t.clamp_min(X_PRED_MIN_T)
+            else:
+                v_other = noise[other] - x0[other]
+            contrast = ((v_pred - v_other).pow(2).mean(-1) * weight).sum() / weight.sum().clamp_min(1)
+            loss = loss - cfg.contrastive_weight * contrast
+        if cfg.dispersive_weight and self.training:
+            # Dispersive loss (InfoNCE with squared distances, no positives): spread the image representations apart
+            z = out.features.float()
+            dist = torch.cdist(z, z).pow(2) / z.shape[-1]
+            off = ~torch.eye(b, dtype=torch.bool, device=z.device)
+            dispersive = torch.logsumexp(-dist[off] / DISPERSIVE_TEMPERATURE, 0) - math.log(off.sum().item())
+            loss = loss + cfg.dispersive_weight * dispersive
         return HydroDiffOutput(
             loss=loss, denoise_loss=denoise_loss, uncertainty_loss=uncertainty_loss, prediction=out.prediction,
             timesteps=timesteps,
@@ -469,33 +502,41 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
 
     # ---------------------------------------------------------------------------------------------------- sampling
 
-    def _velocity_and_error(self, x, t, labels, index, caches, guidance):
+    def _velocity_and_error(self, x, t, labels, index, caches, guidance, self_cond=None, first_step=False):
         """
         The velocity of the active tokens, with guidance: `v_ref + scale * (v - v_ref)`. The reference is the
         unconditional model (classifier-free guidance), optionally with some blocks left out, or a weaker model with the
         same label (autoguidance). Outside `interval` (per-token noise levels) the plain conditional velocity is used.
         """
-        scale, interval, skip_layers, guide_model = guidance
+        scale, interval, skip_layers, guide_model, schedule, cfg_zero = guidance
         if scale == 1 or (labels is None and guide_model is None):
-            out = self.model(x, t, labels, index, caches[0])
+            out = self.model(x, t, labels, index, caches[0], self_cond=self_cond)
             return self.velocity(out.prediction, x, t), out.log_error
         if guide_model is None and not skip_layers:  # plain classifier-free guidance: one batched pass
             null = torch.full_like(labels, self.config.num_classes)
             both = lambda z: None if z is None else torch.cat([z, z])
-            out = self.model(both(x), both(t), torch.cat([labels, null]), both(index), caches[0])
+            out = self.model(both(x), both(t), torch.cat([labels, null]), both(index), caches[0], self_cond=both(self_cond))
             v, v_ref = self.velocity(out.prediction, both(x), both(t)).chunk(2)
             log_error = out.log_error.chunk(2)[0]
         else:
-            out = self.model(x, t, labels, index, caches[0])
+            out = self.model(x, t, labels, index, caches[0], self_cond=self_cond)
             v, log_error = self.velocity(out.prediction, x, t), out.log_error
             if guide_model is not None:
-                ref = guide_model.model(x, t, labels, index, caches[1])
+                guide_cond = self_cond if guide_model.config.self_condition else None
+                ref = guide_model.model(x, t, labels, index, caches[1], self_cond=guide_cond)
                 v_ref = guide_model.velocity(ref.prediction, x, t)
             else:
                 null = torch.full_like(labels, self.config.num_classes)
-                ref = self.model(x, t, null, index, caches[1], skip_layers=skip_layers)
+                ref = self.model(x, t, null, index, caches[1], skip_layers=skip_layers, self_cond=self_cond)
                 v_ref = self.velocity(ref.prediction, x, t)
-        guided = v_ref + scale * (v - v_ref)
+        if cfg_zero:  # CFG-Zero*: scale the reference by its projection on the conditional velocity, per image
+            dims = tuple(range(1, v.ndim))
+            proj = (v * v_ref).sum(dims, keepdim=True) / v_ref.pow(2).sum(dims, keepdim=True).clamp_min(1e-8)
+            v_ref = proj * v_ref
+            if first_step:
+                return torch.zeros_like(v), log_error
+        weight = scale if schedule == "constant" else 1 + (scale - 1) * 2 * (1 - t[..., None])  # "linear": rises as t falls
+        guided = v_ref + weight * (v - v_ref)
         if interval is not None:
             inside = ((t >= interval[0]) & (t <= interval[1]))[..., None]
             guided = torch.where(inside, guided, v)
@@ -517,6 +558,8 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         guidance_interval: tuple[float, float] | None = None,
         uncond_skip_layers: tuple[int, ...] = (),
         guide_model: "HydroDiffForImageGeneration | None" = None,
+        guidance_schedule: str = "constant",
+        cfg_zero: bool = False,
         time_shift: float | None = None,
         reuse: float = 0.0,
         reuse_by: str = "uncertainty",
@@ -550,7 +593,10 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         Guidance (`guidance_scale` > 1) mixes in a reference velocity: the unconditional model (classifier-free
         guidance), the unconditional model without the blocks in `uncond_skip_layers` (as MOSS-Image does), or a
         weaker `guide_model` given the same labels (autoguidance). `guidance_interval=(lo, hi)` applies it only to
-        tokens whose noise level is in that range. `time_shift` overrides the configuration's schedule shift.
+        tokens whose noise level is in that range; `guidance_schedule="linear"` raises the scale from 1 at pure noise to
+        `2 * guidance_scale - 1` at the clean end (same mean); `cfg_zero=True` applies CFG-Zero* (the reference is
+        scaled by its projection on the conditional velocity, and the first step is skipped). `time_shift` overrides
+        the configuration's schedule shift.
 
         `reuse` > 0 widens the update mask: that share of the moving tokens - the surest ones - skips the network in a
         step and moves with its estimate from the step before (never twice in a row, never on its last step);
@@ -587,7 +633,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         evaluations = torch.zeros(b, n, device=device)  # steps in which each token was run while it still had noise
         just_finished = torch.zeros(b, n, dtype=torch.bool, device=device)
         caches = (HydroDiffTokenCache(), HydroDiffTokenCache())
-        guidance = (guidance_scale, guidance_interval, tuple(uncond_skip_layers), guide_model)
+        guidance = (guidance_scale, guidance_interval, tuple(uncond_skip_layers), guide_model, guidance_schedule, cfg_zero)
         shift = cfg.time_shift if time_shift is None else time_shift
         to_t = lambda q: shift_time(1 - q, shift)
         evaluated, noise_masks, update_masks = 0, [to_t(progress)], []
@@ -622,7 +668,11 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
                 index = (need.float() + torch.rand(b, n, device=device, generator=generator) * 0.5).topk(count, -1).indices
                 index = index.sort(-1).values
             x_a, t_a = gather_tokens(x, index), to_t(gather_tokens(progress, index))
-            v, err = self._velocity_and_error(x_a, t_a.to(x.dtype), labels, index, caches, guidance)
+            has_estimate = k > (1 if cfg_zero and guidance_scale != 1 else 0)  # the CFG-Zero* first step estimates nothing
+            self_cond = gather_tokens(x0, index) if cfg.self_condition and has_estimate else None
+            v, err = self._velocity_and_error(
+                x_a, t_a.to(x.dtype), labels, index, caches, guidance, self_cond, first_step=k == 0
+            )
             x0 = scatter_tokens(x0, index, x_a - t_a[..., None].to(x.dtype) * v)
             log_error = scatter_tokens(log_error, index, err.float())
             computed = scatter_tokens(torch.zeros_like(need), index, torch.ones_like(t_a, dtype=torch.bool))
