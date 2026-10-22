@@ -451,10 +451,6 @@ What this settles:
   move the quality-per-compute frontier past "use a good solver and few steps" here. They matter where many steps
   are needed - larger images, harder data, higher quality - which this CPU bench cannot reach.
 
-<!-- FINAL -->
-
-<!-- REMOTE -->
-
 ## Prior work
 
 The three ideas each have close relatives in recent work. The review (2022-2026) shaped the design:
