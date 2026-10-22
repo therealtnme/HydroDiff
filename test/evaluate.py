@@ -4,7 +4,8 @@ Samples from a checkpoint and reports FID against CIFAR-10 train images, samplin
     python test/evaluate.py --ckpt runs/base/ema --n 5000 --gen steps=32 adaptive=false
     python test/evaluate.py --ckpt runs/base/ema --n 5000 --gen steps=32 adaptive=true max_rate=2
 
-`--gen key=value` is passed to `HydroDiffForImageGeneration.generate`. FID uses the pytorch-fid InceptionV3 (2048-d
+`--gen key=value` is passed to `HydroDiffForImageGeneration.generate` (`guide=<checkpoint>` loads a weaker model for
+autoguidance). FID uses the pytorch-fid InceptionV3 (2048-d
 pool features). With fewer than 50k samples FID is biased upwards, so only compare numbers measured with the same `--n`.
 `compute` is token evaluations relative to a dense sampler with the same steps. `--compare` also runs a dense sampler
 with the same seeds and reports how far the images move (PSNR), which isolates the error of a fast sampler.
@@ -103,7 +104,10 @@ def main():
 
     gen = {k: parse_value(v) for k, v in (kv.split("=", 1) for kv in args.gen)}
     model = HydroDiffForImageGeneration.from_pretrained(args.ckpt).eval()
-    images, compute, seconds = sample(model, args.n, args.batch, args.seed, gen)
+    sampler_args = dict(gen)
+    if "guide" in sampler_args:  # autoguidance: guide=<checkpoint of a weaker model>
+        sampler_args["guide_model"] = HydroDiffForImageGeneration.from_pretrained(sampler_args.pop("guide")).eval()
+    images, compute, seconds = sample(model, args.n, args.batch, args.seed, sampler_args)
     result = dict(tag=args.tag, ckpt=args.ckpt, n=args.n, gen=gen, compute=round(compute, 4),
                   ms_per_image=round(1000 * seconds / args.n, 3))
     if args.compare:  # same steps, solver and guidance; every token computed in every step
