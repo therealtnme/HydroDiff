@@ -158,8 +158,10 @@ def main():
             opt.step()
             opt.zero_grad(set_to_none=True)
         with torch.no_grad():
+            warm = min(args.ema, (1 + step) / (10 + step))
             for target, average in emas.items():
-                decay = min(target, (1 + step) / (10 + step))
+                # every EMA follows the main one's warmup with its half-life scaled, so each reaches its own decay
+                decay = 1 - (1 - warm) * (1 - target) / (1 - args.ema)
                 for pe, pm in zip(average.parameters(), model.parameters()):
                     pe.lerp_(pm, 1 - decay)
                 for be, bm in zip(average.buffers(), model.buffers()):
