@@ -567,7 +567,8 @@ models; the default row was also reproduced locally (same FID without guidance, 
 * **Self-conditioning** (Analog Bits, Chen et al., 2023): on half of the training steps the model first predicts the
   clean patches without gradients and gets that estimate as an extra input; when sampling, every step after the first
   gets the previous step's estimate, gathered with the active tokens like everything else. It is 1.0-1.9 FID better in
-  every setting on both seeds and costs nothing at sampling time (one linear layer); training is about 17% slower. On
+  every setting on both seeds and costs nothing at sampling time (one linear layer); training is about 10% slower (80.6 against 89.4 images per
+  second for the contrastive run in the same container). On
   in every preset (old checkpoints load without it).
 * **Training length** is still the largest lever: 24,000 steps are 4 FID better than 12,000 at every guidance
   setting, and the validation loss was still falling.
