@@ -489,9 +489,11 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
             contrast = ((v_pred - v_other).pow(2).mean(-1) * weight).sum() / weight.sum().clamp_min(1)
             loss = loss - cfg.contrastive_weight * contrast
         if cfg.dispersive_weight and self.training:
-            # Dispersive loss (InfoNCE with squared distances, no positives): spread the image representations apart
-            z = out.features.float()
-            dist = torch.cdist(z, z).pow(2) / z.shape[-1]
+            # Dispersive loss (InfoNCE with squared distances, no positives): spread the image representations apart.
+            # On the unit sphere: the residual stream has no fixed scale, and unnormalised features let the model drive
+            # the loss to minus infinity by growing them (training diverged that way)
+            z = F.normalize(out.features.float(), dim=-1)
+            dist = torch.cdist(z, z).pow(2)
             off = ~torch.eye(b, dtype=torch.bool, device=z.device)
             dispersive = torch.logsumexp(-dist[off] / DISPERSIVE_TEMPERATURE, 0) - math.log(off.sum().item())
             loss = loss + cfg.dispersive_weight * dispersive

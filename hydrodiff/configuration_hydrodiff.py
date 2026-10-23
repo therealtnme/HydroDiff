@@ -63,7 +63,7 @@ class HydroDiffConfig(PreTrainedConfig):
         self_condition (`bool`): Feed the model its previous clean-patch estimate (half of the training steps; every
             step after the first at sampling). On in every preset.
         contrastive_weight (`float`): Contrastive flow matching - push the prediction away from another image's target.
-        dispersive_weight (`float`): Dispersive loss on the mid-network image representation.
+        dispersive_weight (`float`): Dispersive loss on the mid-network image representation (unit-normalised).
         guidance_scale (`float`), guidance_min_t (`float`), guidance_max_t (`float`): Default classifier-free guidance
             of [`~HydroDiffForImageGeneration.generate`]: the scale, applied only to tokens whose noise level is in
             `[guidance_min_t, guidance_max_t]` (guidance at the ends of the trajectory cost quality on the bench).

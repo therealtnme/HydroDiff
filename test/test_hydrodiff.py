@@ -15,6 +15,7 @@ torch.set_num_threads(1)
 
 from hydrodiff import HydroDiffConfig, HydroDiffForImageGeneration  # noqa: E402
 from hydrodiff.modeling_hydrodiff import (  # noqa: E402
+    DISPERSIVE_TEMPERATURE,
     X_PRED_MIN_T,
     HydroDiffTokenCache,
     gather_tokens,
@@ -495,3 +496,18 @@ def test_generate_uses_the_configured_guidance(make_model):
     explicit = sample(model, guidance_scale=3.0, guidance_interval=(0.2, 0.85))
     torch.testing.assert_close(sample(model).images, explicit.images)
     assert not torch.allclose(sample(model, guidance_scale=1.0).images, explicit.images)
+
+
+def test_dispersive_loss_is_bounded_below(make_model):
+    """Growing the features cannot lower the dispersive loss without limit (they are normalised first)."""
+    model = make_model(dispersive_weight=1.0, self_condition=False).train()
+    pixels, labels = torch.rand(4, 3, 16, 16) * 2 - 1, torch.tensor([0, 1, 2, 3])
+    losses = []
+    for scale in (1.0, 1e3):
+        with torch.no_grad():
+            model.model.patch_embed.weight.mul_(scale)
+        torch.manual_seed(0)
+        out = model(pixels, labels)
+        losses.append(out.loss - out.denoise_loss - model.config.uncertainty_loss_weight * out.uncertainty_loss)
+    lowest = -4 / DISPERSIVE_TEMPERATURE  # unit vectors are at most 2 apart
+    assert all(lowest - 1e-4 <= loss <= 1e-6 for loss in losses), losses
