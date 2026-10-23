@@ -19,6 +19,7 @@ Every idea was measured on CIFAR-10 (32x32, class-conditional) with the 3M-param
 | `hetero_start` (new) | Starts mixed-level training at the sampler's warmup; removes most of what mixed-level training costs the plain sampler. | Default |
 | Share of mixed images (`hetero_prob`) | 0.25 beat 0.5 by 0.6-1.4 FID in every sampler setting at 12,000 steps. | Default `0.25` |
 | Classifier-free guidance on noise levels 0.2-0.85 | Scale 3 on that interval is about 8 FID better than no guidance (32.16 / 32.00 against 41.45 / 40.04) and 1 FID better than the best scale on all levels. CFG-Zero\*, leaving a block out of the unconditional pass (MOSS-Image) and autoguidance did not help. Costs a second model pass. | Default |
+| Self-conditioning | The model gets its previous clean-image estimate as an input: 30.36 / 30.48 against 31.86 / 31.50 with the default guidance, free at sampling time. Contrastive flow matching (4 FID worse), v-prediction and high-noise training (from MOSS-Image) did not help. Training twice as long gave 27.45 / 27.20. | Default in every preset |
 | `min_token_steps` (new) | No token may take fewer steps than this (16 with Euler, 10 with DPM-Solver; `reuse` always keeps 16 evaluations); prevents the quality loss of fast tokens on too coarse a time grid. | Default |
 
 ### Final model

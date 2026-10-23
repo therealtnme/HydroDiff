@@ -347,8 +347,11 @@ def test_build_optimizers_muon(make_model):
 
     g = torch.Generator().manual_seed(5)
     pixels = torch.rand(2, 3, 16, 16, generator=g) * 2 - 1
-    torch.manual_seed(0)
-    model(pixels, labels=torch.tensor([1, 2])).loss.backward()
+    for seed in range(8):  # the self-conditioning pass runs on half of the training steps
+        torch.manual_seed(seed)
+        model(pixels, labels=torch.tensor([1, 2])).loss.backward()
+        if model.model.self_cond_embed.weight.grad is not None:
+            break
     before = {name: p.detach().clone() for name, p in model.named_parameters()}
     for opt in optimizers:
         opt.step()

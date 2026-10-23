@@ -37,6 +37,7 @@ evidence of anything.
 | `min_token_steps` (new): no token on a time grid coarser than the saturation point | Removes the noise mask's losses at 16-20 steps (sections 9, 10). | Yes, default |
 | DPM-Solver++(2M) per token | Worse than Euler on briefly trained models, better on trained ones and the better partner for the masks (sections 5, 9, 10). | Yes, default |
 | Long skips, v-prediction | Help the dense sampler only; no change under the noise mask (section 8). | Options |
+| Self-conditioning | 1.0-1.9 FID better in every guidance setting, free at sampling time (section 13). Contrastive flow matching, v-prediction and high-noise training did not help. | Yes, in every preset |
 | Classifier-free guidance, scale 3 on noise levels 0.2-0.85 | About 8 FID better than no guidance; the noise mask keeps its saving. CFG-Zero*, a skipped block in the unconditional pass and autoguidance did not help (section 12). | Yes, default |
 
 The user's three hypotheses, as measured:
@@ -546,6 +547,35 @@ A remote sub-agent repeated the scale sweep on the default model (`hetero_prob=0
   29 ms per image in a batch of 100 on 4 threads). `guidance_scale=1` gives unguided sampling.
 
 ![The same starting noise without guidance (left) and with the default guidance (right)](figures/guidance.png)
+
+## 13. Image quality: training changes
+
+`hydrodiff-s`, 12,000 steps unless stated, each change on its own against the default configuration of section 11;
+DPM-Solver, 16 steps, noise mask, 2,000 samples, two sampling seeds. Remote sub-agents trained and measured these
+models; the default row was also reproduced locally (same FID without guidance, 39.87).
+
+| Model | No guidance | Scale 2 | Default guidance (scale 3 on 0.2-0.85) |
+| --- | --- | --- | --- |
+| default | 39.87 / 38.91 | 33.05 / 32.58 | 31.86 / 31.50 |
+| **self-conditioning (`self_condition=True`)** | **38.69 / 38.03** | **31.16 / 31.27** | **30.36 / 30.48** (dense 29.72) |
+| contrastive flow matching (`contrastive_weight=0.05`) | 43.76 / 43.36 | 36.48 / 36.59 | - |
+| velocity prediction (as MOSS-Image) | 39.62 / 38.62 | 33.27 / 33.11 | - |
+| noise levels skewed to pure noise (`timestep_mean=0.5`, as MOSS-Image) | 41.46 / 40.34 | 35.52 / 34.91 | - |
+| EMA 0.99925 instead of 0.999 | 40.25 | - | 31.90 / 31.72 |
+| default, 24,000 steps | 35.89 / 35.24 | 28.98 / 28.35 | **27.45 / 27.20** (dense 26.92) |
+
+* **Self-conditioning** (Analog Bits, Chen et al., 2023): on half of the training steps the model first predicts the
+  clean patches without gradients and gets that estimate as an extra input; when sampling, every step after the first
+  gets the previous step's estimate, gathered with the active tokens like everything else. It is 1.0-1.9 FID better in
+  every setting on both seeds and costs nothing at sampling time (one linear layer); training is about 17% slower. On
+  in every preset (old checkpoints load without it).
+* **Training length** is still the largest lever: 24,000 steps are 4 FID better than 12,000 at every guidance
+  setting, and the validation loss was still falling.
+* Contrastive flow matching costs 4 FID here: with ten classes and batches of 64 the "other" target often has the same
+  class, and pushing away from it hurts. The two MOSS-Image training choices do not carry over to 32x32 pixels:
+  v-prediction is level with x-prediction, and training on more high-noise levels is 1.6-2 FID worse.
+* The EMA row is the run in which the extra EMAs were capped by a shared warmup (fixed in `train.py`); it compares
+  0.999 with 0.99925 only.
 
 ## Prior work
 

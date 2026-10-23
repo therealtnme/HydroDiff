@@ -5,17 +5,19 @@ from transformers.configuration_utils import PreTrainedConfig
 
 # Pixel-space diffusion transformers over patch tokens. The `-moe` presets keep the active parameters of the dense
 # preset they are named after and add routed experts (see test/RESEARCH.md for what each part bought on the bench).
+# Every preset uses self-conditioning; the class default stays off so that older checkpoints load unchanged.
+_COMMON = dict(self_condition=True)
 HYDRODIFF_PRESETS = {
-    "hydrodiff-s": dict(hidden_size=192, intermediate_size=512, num_hidden_layers=6, num_attention_heads=3),
-    "hydrodiff-b": dict(hidden_size=256, intermediate_size=704, num_hidden_layers=8, num_attention_heads=4),
-    "hydrodiff-l": dict(hidden_size=512, intermediate_size=1408, num_hidden_layers=12, num_attention_heads=8),
+    "hydrodiff-s": dict(hidden_size=192, intermediate_size=512, num_hidden_layers=6, num_attention_heads=3, **_COMMON),
+    "hydrodiff-b": dict(hidden_size=256, intermediate_size=704, num_hidden_layers=8, num_attention_heads=4, **_COMMON),
+    "hydrodiff-l": dict(hidden_size=512, intermediate_size=1408, num_hidden_layers=12, num_attention_heads=8, **_COMMON),
     "hydrodiff-s-moe": dict(
         hidden_size=192, intermediate_size=512, num_hidden_layers=6, num_attention_heads=3,
-        num_experts=8, num_experts_per_tok=1, moe_intermediate_size=256, first_dense_layers=1,
+        num_experts=8, num_experts_per_tok=1, moe_intermediate_size=256, first_dense_layers=1, **_COMMON,
     ),
     "hydrodiff-b-moe": dict(
         hidden_size=256, intermediate_size=704, num_hidden_layers=8, num_attention_heads=4,
-        num_experts=8, num_experts_per_tok=1, moe_intermediate_size=352, first_dense_layers=1,
+        num_experts=8, num_experts_per_tok=1, moe_intermediate_size=352, first_dense_layers=1, **_COMMON,
     ),
 }
 
@@ -59,7 +61,7 @@ class HydroDiffConfig(PreTrainedConfig):
         uncertainty_loss_weight (`float`): Weight of the head that predicts each token's denoising error; its output
             is the noise mask.
         self_condition (`bool`): Feed the model its previous clean-patch estimate (half of the training steps; every
-            step after the first at sampling).
+            step after the first at sampling). On in every preset.
         contrastive_weight (`float`): Contrastive flow matching - push the prediction away from another image's target.
         dispersive_weight (`float`): Dispersive loss on the mid-network image representation.
         guidance_scale (`float`), guidance_min_t (`float`), guidance_max_t (`float`): Default classifier-free guidance
