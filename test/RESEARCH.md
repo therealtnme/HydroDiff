@@ -563,6 +563,9 @@ models; the default row was also reproduced locally (same FID without guidance, 
 | noise levels skewed to pure noise (`timestep_mean=0.5`, as MOSS-Image) | 41.46 / 40.34 | 35.52 / 34.91 | - |
 | EMA 0.99925 instead of 0.999 | 40.25 | - | 31.90 / 31.72 |
 | default, 24,000 steps | 35.89 / 35.24 | 28.98 / 28.35 | **27.45 / 27.20** (dense 26.92) |
+| default, 48,000 steps | 33.27 | 26.17 (all levels) | **25.23 / 25.14** |
+| default, 48,000 steps, EMA 0.9995 | 33.47 | 26.59 (all levels) | 25.49 / 25.34 |
+| default, 48,000 steps, EMA 0.9998 | 33.96 | 27.17 (all levels) | 25.99 / 25.77 |
 | self-conditioning, 24,000 steps (local run) | 35.64 | - | 27.52 / 27.11 (dense 27.21) |
 | `hydrodiff-b` (7.1M parameters), 12,000 steps | 35.69 / 35.58 | 28.58 / 28.85 | 27.79 / 28.16 |
 | dispersive loss, first version (`dispersive_weight=0.25`) | 437 (diverged) | 437 | - |
@@ -585,7 +588,10 @@ Patch size, at 4,000 steps (a separate pair of runs; FID is higher at this train
   at least at this scale. It is on in every preset, because it helps short runs and costs nothing at sampling time
   (old checkpoints load without it).
 * **Training length** is still the largest lever: 24,000 steps are 4 FID better than 12,000 at every guidance
-  setting, and the validation loss was still falling.
+  setting, and 48,000 steps another 2.2 better (25.23 / 25.14 with the default guidance); the validation loss was
+  still falling at 48,000 steps. The interval guidance keeps its 1 FID lead over the best constant scale.
+* **A longer EMA does not help** at 48,000 steps: 0.9995 and 0.9998 (MOSS-Image uses 0.9999 for far longer runs)
+  are 0.25 and 0.7 FID worse than the default 0.999, and their validation loss is no better.
 * Contrastive flow matching costs 4 FID here: with ten classes and batches of 64 the "other" target often has the same
   class, and pushing away from it hurts. The two MOSS-Image training choices do not carry over to 32x32 pixels:
   v-prediction is level with x-prediction, and training on more high-noise levels is 1.6-2 FID worse.
