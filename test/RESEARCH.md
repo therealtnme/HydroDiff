@@ -37,7 +37,7 @@ evidence of anything.
 | `min_token_steps` (new): no token on a time grid coarser than the saturation point | Removes the noise mask's losses at 16-20 steps (sections 9, 10). | Yes, default |
 | DPM-Solver++(2M) per token | Worse than Euler on briefly trained models, better on trained ones and the better partner for the masks (sections 5, 9, 10). | Yes, default |
 | Long skips, v-prediction | Help the dense sampler only; no change under the noise mask (section 8). | Options |
-| Self-conditioning | 1.0-1.9 FID better in every guidance setting, free at sampling time (section 13). Contrastive flow matching, v-prediction and high-noise training did not help. | Yes, in every preset |
+| Self-conditioning | 1.0-1.9 FID better in every guidance setting, free at sampling time (section 13). Contrastive flow matching, the dispersive loss, v-prediction and high-noise training did not help. | Yes, in every preset |
 | Classifier-free guidance, scale 3 on noise levels 0.2-0.85 | About 8 FID better than no guidance; the noise mask keeps its saving. CFG-Zero*, a skipped block in the unconditional pass and autoguidance did not help (section 12). | Yes, default |
 
 The user's three hypotheses, as measured:
@@ -566,6 +566,7 @@ models; the default row was also reproduced locally (same FID without guidance, 
 | `hydrodiff-b` (7.1M parameters), 12,000 steps | 35.69 / 35.58 | 28.58 / 28.85 | 27.79 / 28.16 |
 | dispersive loss, first version (`dispersive_weight=0.25`) | 437 (diverged) | 437 | - |
 | all three new losses (first dispersive version) | 393 (diverged) | 392 | - |
+| self-conditioning + dispersive loss, normalised (`dispersive_weight=0.25`) | 52.08 | 46.16 (all levels) | 46.17 / 45.14 |
 
 Patch size, at 4,000 steps (a separate pair of runs; FID is higher at this training length):
 
@@ -592,7 +593,9 @@ Patch size, at 4,000 steps (a separate pair of runs; FID is higher at this train
   `hydrodiff-s` with 4x4 patches; more training is the cheapest way to better images.
 * The first dispersive loss used the residual stream's mean features without normalising them. The model lowered the
   loss without limit by growing the features, and training diverged. The features are now unit vectors (the loss lies
-  in [-8, 0]); the fixed version is being measured.
+  in [-8, 0]). The fixed version trains, but is 15 FID worse than self-conditioning alone: at weight 0.25 the
+  loss can reach -2, more than ten times the denoising loss (about 0.14), so it dominates training. A much smaller
+  weight was not tried; the option stays off.
 * The EMA row is the run in which the extra EMAs were capped by a shared warmup (fixed in `train.py`); it compares
   0.999 with 0.99925 only.
 
