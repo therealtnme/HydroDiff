@@ -37,7 +37,7 @@ evidence of anything.
 | `min_token_steps` (new): no token on a time grid coarser than the saturation point | Removes the noise mask's losses at 16-20 steps (sections 9, 10). | Yes, default |
 | DPM-Solver++(2M) per token | Worse than Euler on briefly trained models, better on trained ones and the better partner for the masks (sections 5, 9, 10). | Yes, default |
 | Long skips, v-prediction | Help the dense sampler only; no change under the noise mask (section 8). | Options |
-| Self-conditioning | 1.0-1.9 FID better in every guidance setting, free at sampling time (section 13). Contrastive flow matching, the dispersive loss, v-prediction and high-noise training did not help. | Yes, in every preset |
+| Self-conditioning | 1.0-1.9 FID better in every guidance setting at 12,000 steps, level at 24,000; free at sampling time (section 13). Contrastive flow matching, the dispersive loss, v-prediction and high-noise training did not help. | Yes, in every preset |
 | Classifier-free guidance, scale 3 on noise levels 0.2-0.85 | About 8 FID better than no guidance; the noise mask keeps its saving. CFG-Zero*, a skipped block in the unconditional pass and autoguidance did not help (section 12). | Yes, default |
 
 The user's three hypotheses, as measured:
@@ -563,6 +563,7 @@ models; the default row was also reproduced locally (same FID without guidance, 
 | noise levels skewed to pure noise (`timestep_mean=0.5`, as MOSS-Image) | 41.46 / 40.34 | 35.52 / 34.91 | - |
 | EMA 0.99925 instead of 0.999 | 40.25 | - | 31.90 / 31.72 |
 | default, 24,000 steps | 35.89 / 35.24 | 28.98 / 28.35 | **27.45 / 27.20** (dense 26.92) |
+| self-conditioning, 24,000 steps (local run) | 35.64 | - | 27.52 / 27.11 (dense 27.21) |
 | `hydrodiff-b` (7.1M parameters), 12,000 steps | 35.69 / 35.58 | 28.58 / 28.85 | 27.79 / 28.16 |
 | dispersive loss, first version (`dispersive_weight=0.25`) | 437 (diverged) | 437 | - |
 | all three new losses (first dispersive version) | 393 (diverged) | 392 | - |
@@ -578,9 +579,11 @@ Patch size, at 4,000 steps (a separate pair of runs; FID is higher at this train
 * **Self-conditioning** (Analog Bits, Chen et al., 2023): on half of the training steps the model first predicts the
   clean patches without gradients and gets that estimate as an extra input; when sampling, every step after the first
   gets the previous step's estimate, gathered with the active tokens like everything else. It is 1.0-1.9 FID better in
-  every setting on both seeds and costs nothing at sampling time (one linear layer); training is about 10% slower (80.6 against 89.4 images per
-  second for the contrastive run in the same container). On
-  in every preset (old checkpoints load without it).
+  every setting on both seeds at 12,000 steps and costs nothing at sampling time (one linear layer); training is about
+  10% slower (80.6 against 89.4 images per second for the contrastive run in the same container). At 24,000 steps the
+  gain is gone (27.52 / 27.11 against 27.45 / 27.20): it speeds up training rather than raising where training ends,
+  at least at this scale. It is on in every preset, because it helps short runs and costs nothing at sampling time
+  (old checkpoints load without it).
 * **Training length** is still the largest lever: 24,000 steps are 4 FID better than 12,000 at every guidance
   setting, and the validation loss was still falling.
 * Contrastive flow matching costs 4 FID here: with ten classes and batches of 64 the "other" target often has the same
