@@ -563,6 +563,16 @@ models; the default row was also reproduced locally (same FID without guidance, 
 | noise levels skewed to pure noise (`timestep_mean=0.5`, as MOSS-Image) | 41.46 / 40.34 | 35.52 / 34.91 | - |
 | EMA 0.99925 instead of 0.999 | 40.25 | - | 31.90 / 31.72 |
 | default, 24,000 steps | 35.89 / 35.24 | 28.98 / 28.35 | **27.45 / 27.20** (dense 26.92) |
+| `hydrodiff-b` (7.1M parameters), 12,000 steps | 35.69 / 35.58 | 28.58 / 28.85 | 27.79 / 28.16 |
+| dispersive loss, first version (`dispersive_weight=0.25`) | 437 (diverged) | 437 | - |
+| all three new losses (first dispersive version) | 393 (diverged) | 392 | - |
+
+Patch size, at 4,000 steps (a separate pair of runs; FID is higher at this training length):
+
+| Patches | Tokens | Training time | No guidance | Scale 2 | ms / image (4 threads) |
+| --- | --- | --- | --- | --- | --- |
+| 4x4 | 64 | 56 min | 50.54 | 43.65 / 42.70 | 33 |
+| 2x2 | 256 | 204 min | 43.49 | 35.64 / 36.13 | 239 |
 
 * **Self-conditioning** (Analog Bits, Chen et al., 2023): on half of the training steps the model first predicts the
   clean patches without gradients and gets that estimate as an extra input; when sampling, every step after the first
@@ -575,6 +585,14 @@ models; the default row was also reproduced locally (same FID without guidance, 
 * Contrastive flow matching costs 4 FID here: with ten classes and batches of 64 the "other" target often has the same
   class, and pushing away from it hurts. The two MOSS-Image training choices do not carry over to 32x32 pixels:
   v-prediction is level with x-prediction, and training on more high-noise levels is 1.6-2 FID worse.
+* **Model size and patch size** buy quality at the same price as training length. `hydrodiff-b` at 12,000 steps
+  (about twice the compute per step) equals `hydrodiff-s` at 24,000 steps, but samples about twice as slowly. 2x2
+  patches are 7-8 FID better than 4x4 at the same step count, but cost 3.6 times the training time and 7 times the
+  sampling time; `hydrodiff-s` with 4x4 patches trained for the same time (12,000 steps) is better. The defaults stay
+  `hydrodiff-s` with 4x4 patches; more training is the cheapest way to better images.
+* The first dispersive loss used the residual stream's mean features without normalising them. The model lowered the
+  loss without limit by growing the features, and training diverged. The features are now unit vectors (the loss lies
+  in [-8, 0]); the fixed version is being measured.
 * The EMA row is the run in which the extra EMAs were capped by a shared warmup (fixed in `train.py`); it compares
   0.999 with 0.99925 only.
 
