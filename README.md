@@ -38,6 +38,20 @@ These numbers are without guidance. With the default guidance (scale 3 on noise 
 
 ![The same starting noise without guidance (left) and with the default guidance (right)](test/figures/guidance.png)
 
+### Image quality
+
+What raised image quality, step by step (`hydrodiff-s`, 16 DPM-Solver steps with the noise mask, FID with 2,000
+samples on two seeds; [`test/RESEARCH.md`](test/RESEARCH.md), sections 12-13):
+
+| Model and sampler | FID |
+| ----------------- | --- |
+| 12,000 steps, no guidance | 39.87 / 38.91 |
+| + guidance 3 on noise levels 0.2-0.85 | 31.86 / 31.50 |
+| + self-conditioning | 30.36 / 30.48 |
+| 24,000 steps, guidance (with or without self-conditioning) | 27.45 / 27.20 |
+
+![100 samples from the 24,000-step model with the default sampler, one class per column](test/figures/samples_24k.png)
+
 The default sampler is 0.5 FID better than the dense sampler on both seeds and 13% faster. With Euler at 32 steps the noise mask gives 40.69 / 39.53 against 41.04 / 39.94 for 84% of the compute. An earlier final model (`hetero_prob=0.5`) was also checked with 5,000 samples: noise mask 33.52 against dense 33.43 (Euler, 32 steps, 84% of the compute).
 
 ![100 samples from the earlier final model, one class per column](test/figures/samples.png)
