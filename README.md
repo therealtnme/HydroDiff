@@ -1,3 +1,5 @@
+[☕ Support HydroDiff's development](https://buymeacoffee.com/tnme)
+
 # HydroDiff
 
 HydroDiff is an experimental image diffusion model built on top of the Hugging Face Transformers architecture.
