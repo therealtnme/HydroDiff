@@ -46,6 +46,8 @@ class HydroDiffConfig(PreTrainedConfig):
 
     Args:
         image_size (`int`), num_channels (`int`), patch_size (`int`): Image and patch shape.
+        patch_embed_dim (`int`): Low-rank bottleneck of the patch (and self-conditioning) embeddings, as in JiT (0 =
+            one full linear layer). Large pixel patches (32 x 32 x 3 = 3072 values) make the full layer expensive.
         num_classes (`int`): Class labels for conditioning (0 = unconditional). One extra "null" class is added for
             classifier-free guidance; `class_dropout` is the rate at which training uses it.
         long_skips (`bool`): U-ViT long skip connections from each block in the first half to its mirror block.
@@ -72,6 +74,17 @@ class HydroDiffConfig(PreTrainedConfig):
         router_bias_update_rate (`float`): MoE shape and balancing-bias step.
         moe_routing (`str`): `"token"` (each token picks its experts), `"image"` (the whole image picks, per layer and
             step) or `"time"` (no router: each token goes to the expert of its own noise level).
+        modalities (`list[str]`): What the model generates: `["image"]`, `["video"]` or both. An image is a video of one
+            frame; video tokens add a time axis to the rotary positions.
+        text_dim (`int`): Width of the (frozen) text encoder's token embeddings; 0 = no text conditioning. Text enters
+            twice: its pooled embedding joins the per-token modulation, and its tokens are extra keys and values of
+            every attention layer (queries stay image tokens only, so the update mask still removes all their cost).
+        text_max_length (`int`), text_dropout (`float`): Text tokens per prompt, and the rate at which training swaps
+            the prompt for the learned null prompt (classifier-free guidance).
+        image_cond_prob (`float`): Share of video training clips whose first frame is given clean (`t = 0`), which
+            teaches image-to-video with no extra parameters: clean tokens are context, never targets.
+        vae_scale_factor (`int`), latent_scale (`float`), latent_shift (`float`): The model works on `latent =
+            (vae_latent - shift) * scale`; 1 / 1 / 0 means pixel space.
 
     Example:
 
@@ -86,6 +99,7 @@ class HydroDiffConfig(PreTrainedConfig):
     image_size: int = 32
     num_channels: int = 3
     patch_size: int = 4
+    patch_embed_dim: int = 0
     hidden_size: int = 256
     intermediate_size: int = 704
     num_hidden_layers: int = 8
@@ -119,6 +133,16 @@ class HydroDiffConfig(PreTrainedConfig):
     router_bias_update_rate: float | int = 1e-3
     moe_routing: str = "token"
 
+    # Modalities and conditioning (text-to-image / text-to-video / image-to-video)
+    modalities: list[str] | tuple[str, ...] = ("image",)
+    text_dim: int = 0
+    text_max_length: int = 32
+    text_dropout: float | int = 0.1
+    image_cond_prob: float | int = 0.1
+    vae_scale_factor: int = 1
+    latent_scale: float | int = 1.0
+    latent_shift: float | int = 0.0
+
     def __post_init__(self, **kwargs):
         if self.image_size % self.patch_size:
             raise ValueError(f"image_size {self.image_size} is not divisible by patch_size {self.patch_size}")
@@ -134,6 +158,11 @@ class HydroDiffConfig(PreTrainedConfig):
             raise ValueError("hetero_start must be in [0, 1)")
         if self.max_rate < 1:
             raise ValueError("max_rate must be >= 1")
+        self.modalities = list(self.modalities)
+        if not self.modalities or set(self.modalities) - {"image", "video"}:
+            raise ValueError("modalities must be a non-empty subset of ['image', 'video']")
+        if "video" in self.modalities and (self.head_dim // 2) // 4 < 1:
+            raise ValueError("video needs head_dim >= 8 (a third rotary axis for time)")
         super().__post_init__(**kwargs)
 
     @property
@@ -147,6 +176,14 @@ class HydroDiffConfig(PreTrainedConfig):
     @property
     def num_patches(self) -> int:
         return self.patches_per_side**2
+
+    @property
+    def supports_video(self) -> bool:
+        return "video" in self.modalities
+
+    @property
+    def supports_image(self) -> bool:
+        return "image" in self.modalities
 
     @property
     def patch_dim(self) -> int:

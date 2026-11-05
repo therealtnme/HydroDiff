@@ -37,18 +37,28 @@ class HydroDiffRMSNorm(nn.Module):
 
 
 def patchify(images: torch.Tensor, patch_size: int) -> torch.Tensor:
-    """(batch, channels, height, width) -> (batch, tokens, channels * patch_size**2), tokens in row-major order."""
-    b, c, h, w = images.shape
+    """
+    (batch, channels, height, width) or (batch, channels, frames, height, width) -> (batch, tokens, channels *
+    patch_size**2). Tokens are frame-major, then row-major; there is no temporal patching (one token per patch per frame).
+    """
+    if images.ndim == 4:
+        images = images.unsqueeze(2)
+    b, c, f, h, w = images.shape
     p = patch_size
-    x = images.reshape(b, c, h // p, p, w // p, p).permute(0, 2, 4, 1, 3, 5)
-    return x.reshape(b, (h // p) * (w // p), c * p * p)
+    x = images.reshape(b, c, f, h // p, p, w // p, p).permute(0, 2, 3, 5, 1, 4, 6)
+    return x.reshape(b, f * (h // p) * (w // p), c * p * p)
 
 
-def unpatchify(tokens: torch.Tensor, patch_size: int, channels: int) -> torch.Tensor:
+def unpatchify(tokens: torch.Tensor, patch_size: int, channels: int, grid: tuple[int, int, int] | None = None) -> torch.Tensor:
+    """Inverse of `patchify`. `grid` = (frames, rows, cols) of patches; a single frame comes back 4D (an image)."""
     b, n, _ = tokens.shape
-    side, p = math.isqrt(n), patch_size
-    x = tokens.reshape(b, side, side, channels, p, p).permute(0, 3, 1, 4, 2, 5)
-    return x.reshape(b, channels, side * p, side * p)
+    if grid is None:
+        side = math.isqrt(n)
+        grid = (1, side, side)
+    f, gh, gw = grid
+    p = patch_size
+    x = tokens.reshape(b, f, gh, gw, channels, p, p).permute(0, 4, 1, 2, 5, 3, 6).reshape(b, channels, f, gh * p, gw * p)
+    return x[:, :, 0] if f == 1 else x
 
 
 def gather_tokens(x: torch.Tensor, index: torch.Tensor | None) -> torch.Tensor:
@@ -80,15 +90,32 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def rotary_2d(config: HydroDiffConfig, device) -> tuple[torch.Tensor, torch.Tensor]:
-    """Axial 2D rotary angles, (tokens, head_dim): half of each head rotates with the row, half with the column."""
-    side, quarter = config.patches_per_side, config.head_dim // 4
-    inv_freq = 1.0 / config.rope_theta ** (torch.arange(quarter, device=device, dtype=torch.float32) / quarter)
-    pos = torch.arange(side, device=device, dtype=torch.float32)
-    rows, cols = pos.repeat_interleave(side), pos.repeat(side)
-    angles = torch.cat([rows[:, None] * inv_freq, cols[:, None] * inv_freq], dim=-1)
+def rotary_axes(config: HydroDiffConfig) -> tuple[int, int, int]:
+    """Rotary frequencies per axis (time, row, column). Image-only models spend none on time (identical to 2D RoPE)."""
+    half = config.head_dim // 2
+    time = half // 4 if config.supports_video else 0
+    rows = (half - time) // 2
+    return time, rows, half - time - rows
+
+
+def rotary_nd(config: HydroDiffConfig, grid: tuple[int, int, int], device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Axial rotary angles, (tokens, head_dim), for a (frames, rows, cols) grid of patch tokens in frame-major order."""
+    f, gh, gw = grid
+    parts = []
+    for count, size, repeat_outer, repeat_inner in zip(rotary_axes(config), (f, gh, gw), (1, f, f * gh), (gh * gw, gw, 1)):
+        if not count:
+            continue
+        inv_freq = 1.0 / config.rope_theta ** (torch.arange(count, device=device, dtype=torch.float32) / count)
+        pos = torch.arange(size, device=device, dtype=torch.float32).repeat_interleave(repeat_inner).repeat(repeat_outer)
+        parts.append(pos[:, None] * inv_freq)
+    angles = torch.cat(parts, dim=-1)
     angles = torch.cat([angles, angles], dim=-1)
     return angles.cos(), angles.sin()
+
+
+def rotary_2d(config: HydroDiffConfig, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Axial 2D rotary angles of the configured square image (kept for older callers)."""
+    return rotary_nd(config, (1, config.patches_per_side, config.patches_per_side), device)
 
 
 def timestep_embedding(t: torch.Tensor, dim: int = TIME_FREQUENCIES, max_period: float = 10000.0) -> torch.Tensor:
@@ -144,14 +171,19 @@ class HydroDiffAttention(nn.Module):
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.q_norm = HydroDiffRMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = HydroDiffRMSNorm(self.head_dim, config.rms_norm_eps)
+        # Text tokens are extra keys and values (no rotary position, no queries): every image token reads the prompt
+        self.text_kv_proj = nn.Linear(config.hidden_size, 2 * config.hidden_size, bias=False) if config.text_dim else None
 
-    def forward(self, hidden_states, cos, sin, index=None, cache=None):
+    def forward(self, hidden_states, cos, sin, index=None, cache=None, text_states=None):
         b, a, d = hidden_states.shape
         q, k, v = self.qkv_proj(hidden_states).view(b, a, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k = self.q_norm(q), self.k_norm(k)
         q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
         if cache is not None:
             k, v = cache.update(self.layer_idx, k, v, index)
+        if self.text_kv_proj is not None and text_states is not None:
+            tk, tv = self.text_kv_proj(text_states).view(b, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            k, v = torch.cat([k, self.k_norm(tk)], dim=2), torch.cat([v, tv], dim=2)
         out = F.scaled_dot_product_attention(q, k, v)
         return self.o_proj(out.transpose(1, 2).reshape(b, a, d))
 
@@ -244,14 +276,19 @@ class HydroDiffConditioning(nn.Module):
         d = config.hidden_size
         self.time_mlp = nn.Sequential(nn.Linear(TIME_FREQUENCIES, d), nn.SiLU(), nn.Linear(d, d))
         self.class_embed = nn.Embedding(config.num_classes + 1, d) if config.num_classes else None
+        self.text_pool_embed = (
+            nn.Sequential(nn.Linear(config.text_dim, d), nn.SiLU(), nn.Linear(d, d)) if config.text_dim else None
+        )
         self.modulation = nn.Linear(d, 6 * d)
         self.final_modulation = nn.Linear(d, 2 * d)
         self.modulation.zero_init = self.final_modulation.zero_init = True
 
-    def forward(self, timesteps: torch.Tensor, labels: torch.Tensor | None):
+    def forward(self, timesteps: torch.Tensor, labels: torch.Tensor | None, text_pool: torch.Tensor | None = None):
         cond = self.time_mlp(timestep_embedding(timesteps))
-        if self.class_embed is not None:
+        if self.class_embed is not None and labels is not None:
             cond = cond + self.class_embed(labels)[:, None]
+        if self.text_pool_embed is not None and text_pool is not None:
+            cond = cond + self.text_pool_embed(text_pool)[:, None]
         cond = F.silu(cond)
         return self.modulation(cond).unflatten(-1, (6, -1)), self.final_modulation(cond).chunk(2, dim=-1)
 
@@ -268,12 +305,12 @@ class HydroDiffBlock(nn.Module):
         has_skip = config.long_skips and layer_idx >= config.num_hidden_layers - config.num_hidden_layers // 2
         self.skip_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False) if has_skip else None
 
-    def forward(self, hidden_states, modulation, cos, sin, timesteps, index=None, cache=None, skip=None):
+    def forward(self, hidden_states, modulation, cos, sin, timesteps, index=None, cache=None, skip=None, text_states=None):
         if self.skip_proj is not None:
             hidden_states = self.skip_proj(torch.cat([hidden_states, skip], dim=-1))
         shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = (modulation + self.modulation).unbind(-2)
         h = self.attn_norm(hidden_states) * (1 + scale_a) + shift_a
-        hidden_states = hidden_states + gate_a * self.self_attn(h, cos, sin, index, cache)
+        hidden_states = hidden_states + gate_a * self.self_attn(h, cos, sin, index, cache, text_states)
         h = self.mlp_norm(hidden_states) * (1 + scale_m) + shift_m
         return hidden_states + gate_m * self.mlp(h, timesteps, index, cache)
 
@@ -354,12 +391,25 @@ class HydroDiffModel(HydroDiffPreTrainedModel):
 
     def __init__(self, config: HydroDiffConfig):
         super().__init__(config)
-        self.patch_embed = nn.Linear(config.patch_dim, config.hidden_size)
+        r = config.patch_embed_dim
+
+        def embed(bias):
+            if not r:
+                return nn.Linear(config.patch_dim, config.hidden_size, bias=bias)
+            return nn.Sequential(nn.Linear(config.patch_dim, r, bias=False), nn.Linear(r, config.hidden_size, bias=bias))
+
+        self.patch_embed = embed(True)
         # Self-conditioning: the previous clean-patch estimate enters through its own (zero-initialised) projection
-        self.self_cond_embed = nn.Linear(config.patch_dim, config.hidden_size, bias=False) if config.self_condition else None
+        self.self_cond_embed = embed(False) if config.self_condition else None
         if self.self_cond_embed is not None:
-            self.self_cond_embed.zero_init = True
+            (self.self_cond_embed if not r else self.self_cond_embed[1]).zero_init = True
         self.conditioning = HydroDiffConditioning(config)
+        if config.text_dim:
+            # Prompt token embeddings from a frozen text encoder, projected once and shared by every layer; the learned
+            # null prompt replaces the prompt for classifier-free guidance (dropped prompts in training)
+            self.text_embed = nn.Sequential(nn.Linear(config.text_dim, config.hidden_size), HydroDiffRMSNorm(config.hidden_size, config.rms_norm_eps))
+            self.null_text = nn.Parameter(torch.zeros(config.text_max_length, config.text_dim))
+            self.null_text_pool = nn.Parameter(torch.zeros(config.text_dim))
         self.layers = nn.ModuleList([HydroDiffBlock(config, i) for i in range(config.num_hidden_layers)])
         self.norm = HydroDiffRMSNorm(config.hidden_size, config.rms_norm_eps, affine=False)
         self.proj_out = nn.Linear(config.hidden_size, config.patch_dim)
@@ -376,6 +426,9 @@ class HydroDiffModel(HydroDiffPreTrainedModel):
         cache: HydroDiffTokenCache | None = None,
         skip_layers: tuple[int, ...] = (),
         self_cond: torch.Tensor | None = None,
+        grid: tuple[int, int, int] | None = None,
+        text: torch.Tensor | None = None,
+        text_pool: torch.Tensor | None = None,
     ) -> HydroDiffModelOutput:
         """
         noisy_tokens: (batch, active, patch_dim) - all tokens, or only the active ones when `index` is given.
@@ -384,12 +437,23 @@ class HydroDiffModel(HydroDiffPreTrainedModel):
             `cache` they still serve as keys and values from the last step that computed them.
         skip_layers: blocks to leave out (a deliberately weakened model, used as the reference of guidance).
         self_cond: the previous clean-patch estimate of the same tokens (`self_condition=True`; None = no estimate).
+        grid: (frames, rows, cols) of the whole token grid (default: one square frame of the configured size).
+        text: (batch, text_max_length, text_dim) prompt token embeddings; text_pool: (batch, text_dim) pooled prompt.
+            None with a text model = the learned null prompt (unconditional).
         """
-        cos, sin = rotary_2d(self.config, noisy_tokens.device)
+        if grid is None:
+            grid = (1, self.config.patches_per_side, self.config.patches_per_side)
+        cos, sin = rotary_nd(self.config, tuple(grid), noisy_tokens.device)
         if index is not None:
             cos, sin = cos[index], sin[index]
         cos, sin = cos.unsqueeze(-3).to(noisy_tokens.dtype), sin.unsqueeze(-3).to(noisy_tokens.dtype)
-        modulation, (final_shift, final_scale) = self.conditioning(timesteps, labels)
+        text_states = None
+        if self.config.text_dim:
+            b = noisy_tokens.shape[0]
+            if text is None:
+                text, text_pool = self.null_text.expand(b, -1, -1), self.null_text_pool.expand(b, -1)
+            text_states = self.text_embed(text.to(noisy_tokens.dtype))
+        modulation, (final_shift, final_scale) = self.conditioning(timesteps, labels, text_pool)
         hidden_states = self.patch_embed(noisy_tokens)
         if self.self_cond_embed is not None and self_cond is not None:
             hidden_states = hidden_states + self.self_cond_embed(self_cond)
@@ -397,7 +461,7 @@ class HydroDiffModel(HydroDiffPreTrainedModel):
         for i, layer in enumerate(self.layers):
             skip = skips.pop() if layer.skip_proj is not None else None
             if i not in skip_layers:
-                hidden_states = layer(hidden_states, modulation, cos, sin, timesteps, index, cache, skip)
+                hidden_states = layer(hidden_states, modulation, cos, sin, timesteps, index, cache, skip, text_states)
             if self.config.long_skips and i < len(self.layers) // 2:
                 skips.append(hidden_states)
             if i == len(self.layers) // 2 - 1:
@@ -421,7 +485,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
 
     # ---------------------------------------------------------------------------------------------------- training
 
-    def sample_timesteps(self, batch: int, device, generator=None) -> torch.Tensor:
+    def sample_timesteps(self, batch: int, device, generator=None, num_tokens: int | None = None) -> torch.Tensor:
         """
         Per-token noise levels for training. Each image gets a logit-normal progress `q` (how far denoising has got;
         `timestep_mean` > 0 moves it towards high noise).
@@ -429,7 +493,8 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         on, so a token's progress is `q + (r - 1) * (q - hetero_start)`: the states the adaptive sampler produces, where
         confident tokens are ahead of (cleaner than) the rest once its warmup is over.
         """
-        cfg, n = self.config, self.config.num_patches
+        cfg = self.config
+        n = cfg.num_patches if num_tokens is None else num_tokens
         q = 1 - torch.sigmoid(torch.randn(batch, 1, device=device, generator=generator) + cfg.timestep_mean)
         rate = 1 + (cfg.max_rate - 1) * torch.rand(batch, n, device=device, generator=generator)
         hetero = torch.rand(batch, 1, device=device, generator=generator) < cfg.hetero_prob
@@ -442,27 +507,59 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
             return prediction
         return (noisy_tokens - prediction) / timesteps.clamp_min(max(min_t, 1e-6))[..., None]
 
-    def forward(self, pixel_values: torch.Tensor, labels: torch.Tensor | None = None, timesteps=None, noise=None):
-        """pixel_values: (batch, channels, height, width) in [-1, 1]."""
+    def drop_text(self, text, text_pool, drop: torch.Tensor):
+        """Replaces the prompts of the images in `drop` (batch,) with the learned null prompt."""
+        null = self.model.null_text.expand_as(text)
+        text = torch.where(drop[:, None, None], null.to(text.dtype), text)
+        text_pool = torch.where(drop[:, None], self.model.null_text_pool.expand_as(text_pool).to(text_pool.dtype), text_pool)
+        return text, text_pool
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        timesteps=None,
+        noise=None,
+        text: torch.Tensor | None = None,
+        text_pool: torch.Tensor | None = None,
+    ):
+        """
+        pixel_values: (batch, channels, height, width) images or (batch, channels, frames, height, width) videos in the
+        model's input space ([-1, 1] pixels, or normalised latents). Any height and width that are multiples of
+        `patch_size` work; the rotary positions follow the actual grid. `text` / `text_pool`: prompt embeddings
+        (text models); training replaces a `text_dropout` share of them with the null prompt.
+        """
         cfg = self.config
+        frames = pixel_values.shape[2] if pixel_values.ndim == 5 else 1
+        grid = (frames, pixel_values.shape[-2] // cfg.patch_size, pixel_values.shape[-1] // cfg.patch_size)
         x0 = patchify(pixel_values, cfg.patch_size)
-        b = x0.shape[0]
+        b, n = x0.shape[:2]
         if timesteps is None:
-            timesteps = self.sample_timesteps(b, x0.device)
+            timesteps = self.sample_timesteps(b, x0.device, num_tokens=n)
+            if frames > 1 and self.training and cfg.image_cond_prob:
+                # image-to-video: the first frame is given clean - context for the rest, not a target
+                first = torch.rand(b, 1, device=x0.device) < cfg.image_cond_prob
+                in_first = (torch.arange(n, device=x0.device) < grid[1] * grid[2])[None]
+                timesteps = torch.where(first & in_first, torch.zeros_like(timesteps), timesteps)
         noise = torch.randn_like(x0) if noise is None else noise
         if cfg.num_classes:
             labels = torch.full((b,), cfg.num_classes, device=x0.device) if labels is None else labels
             if self.training and cfg.class_dropout:
                 drop = torch.rand(b, device=x0.device) < cfg.class_dropout
                 labels = torch.where(drop, torch.full_like(labels, cfg.num_classes), labels)
+        else:
+            labels = None
+        if cfg.text_dim and text is not None and self.training and cfg.text_dropout:
+            text, text_pool = self.drop_text(text, text_pool, torch.rand(b, device=x0.device) < cfg.text_dropout)
+        cond = dict(grid=grid, text=text, text_pool=text_pool)
         t = timesteps[..., None]
         x_t = (1 - t) * x0 + t * noise
         self_cond = None
         if cfg.self_condition and self.training and torch.rand(()) < 0.5:
             with torch.no_grad():  # half the time, condition on the model's own first estimate (Analog Bits)
-                first = self.model(x_t, timesteps, labels).prediction
+                first = self.model(x_t, timesteps, labels, **cond).prediction
                 self_cond = first if cfg.prediction_type == "x" else x_t - t * first
-        out = self.model(x_t, timesteps, labels, self_cond=self_cond)
+        out = self.model(x_t, timesteps, labels, self_cond=self_cond, **cond)
         if cfg.prediction_type == "x":
             # prediction and target share the clipped 1 / t, so a perfect prediction has zero loss at every t
             v_pred = self.velocity(out.prediction, x_t, timesteps, X_PRED_MIN_T)
@@ -504,32 +601,42 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
 
     # ---------------------------------------------------------------------------------------------------- sampling
 
-    def _velocity_and_error(self, x, t, labels, index, caches, guidance, self_cond=None, first_step=False):
+    def _velocity_and_error(self, x, t, cond, index, caches, guidance, self_cond=None, first_step=False):
         """
         The velocity of the active tokens, with guidance: `v_ref + scale * (v - v_ref)`. The reference is the
-        unconditional model (classifier-free guidance), optionally with some blocks left out, or a weaker model with the
-        same label (autoguidance). Outside `interval` (per-token noise levels) the plain conditional velocity is used.
+        unconditional model (classifier-free guidance: null class and/or null prompt, or a negative prompt), optionally
+        with some blocks left out, or a weaker model with the same condition (autoguidance). Outside `interval`
+        (per-token noise levels) the plain conditional velocity is used.
+
+        `cond` holds `labels`, `text`, `text_pool`, `grid` and, for the reference, `uncond_*` versions of the first three.
         """
         scale, interval, skip_layers, guide_model, schedule, cfg_zero = guidance
-        if scale == 1 or (labels is None and guide_model is None):
-            out = self.model(x, t, labels, index, caches[0], self_cond=self_cond)
+        grid = cond["grid"]
+        pos = dict(labels=cond["labels"], text=cond["text"], text_pool=cond["text_pool"])
+        neg = dict(labels=cond["uncond_labels"], text=cond["uncond_text"], text_pool=cond["uncond_text_pool"])
+        conditioned = pos["labels"] is not None or pos["text"] is not None
+        run = lambda m, z, tt, c, idx, cache, **kw: m.model(  # noqa: E731
+            z, tt, c["labels"], idx, cache, grid=grid, text=c["text"], text_pool=c["text_pool"], **kw
+        )
+        if scale == 1 or (not conditioned and guide_model is None):
+            out = run(self, x, t, pos, index, caches[0], self_cond=self_cond)
             return self.velocity(out.prediction, x, t), out.log_error
         if guide_model is None and not skip_layers:  # plain classifier-free guidance: one batched pass
-            null = torch.full_like(labels, self.config.num_classes)
-            both = lambda z: None if z is None else torch.cat([z, z])
-            out = self.model(both(x), both(t), torch.cat([labels, null]), both(index), caches[0], self_cond=both(self_cond))
+            both = lambda z: None if z is None else torch.cat([z, z])  # noqa: E731
+            pair = lambda p, q: None if p is None else torch.cat([p, q])  # noqa: E731
+            joint = {k: pair(pos[k], neg[k]) for k in pos}
+            out = run(self, both(x), both(t), joint, both(index), caches[0], self_cond=both(self_cond))
             v, v_ref = self.velocity(out.prediction, both(x), both(t)).chunk(2)
             log_error = out.log_error.chunk(2)[0]
         else:
-            out = self.model(x, t, labels, index, caches[0], self_cond=self_cond)
+            out = run(self, x, t, pos, index, caches[0], self_cond=self_cond)
             v, log_error = self.velocity(out.prediction, x, t), out.log_error
             if guide_model is not None:
                 guide_cond = self_cond if guide_model.config.self_condition else None
-                ref = guide_model.model(x, t, labels, index, caches[1], self_cond=guide_cond)
+                ref = run(guide_model, x, t, pos, index, caches[1], self_cond=guide_cond)
                 v_ref = guide_model.velocity(ref.prediction, x, t)
             else:
-                null = torch.full_like(labels, self.config.num_classes)
-                ref = self.model(x, t, null, index, caches[1], skip_layers=skip_layers, self_cond=self_cond)
+                ref = run(self, x, t, neg, index, caches[1], skip_layers=skip_layers, self_cond=self_cond)
                 v_ref = self.velocity(ref.prediction, x, t)
         if cfg_zero:  # CFG-Zero*: scale the reference by its projection on the conditional velocity, per image
             dims = tuple(range(1, v.ndim))
@@ -569,6 +676,16 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         refresh_finished: bool = True,
         generator: torch.Generator | None = None,
         return_masks: bool = False,
+        text: torch.Tensor | None = None,
+        text_pool: torch.Tensor | None = None,
+        negative_text: torch.Tensor | None = None,
+        negative_text_pool: torch.Tensor | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_frames: int = 1,
+        init: torch.Tensor | None = None,
+        strength: float = 1.0,
+        cond_frames: torch.Tensor | None = None,
     ) -> HydroDiffGenerationOutput:
         """
         Samples images in `steps` steps.
@@ -607,6 +724,15 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         `refresh_finished` runs a token once more at `t = 0` in the step after it finishes, so that the cache holds it as
         clean context - what the model saw in training - rather than its last noisy state. `skip_finished=False` computes
         every token in every step (no speed-up; for measuring what the key/value cache costs).
+
+        Conditioning and shape (all in the model's input space - pixels, or normalised latents):
+        `text` / `text_pool` (and optional `negative_text` / `negative_text_pool` as the guidance reference instead of the
+        learned null prompt) condition a text model. `height`, `width` (multiples of `patch_size`; default the
+        configured square) and `num_frames` (1 = an image) set the output grid; video needs `"video"` in
+        `config.modalities`, a single frame needs `"image"`. `init` + `strength` < 1 starts from a noised copy of `init`
+        (image-to-image / video-to-video): only the last `strength` of the trajectory is run, with the same masks.
+        `cond_frames` (batch, channels, k, height, width) are given clean as the first `k` frames (image-to-video): they
+        start finished, so they are computed once and then serve only as keys and values from the cache.
         """
         cfg = self.config
         device = self.device
@@ -614,10 +740,40 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
             raise ValueError("churn must be in [0, 1]")
         if churn and solver != "euler":
             raise ValueError("churn needs solver='euler'")
+        if batch_size is None:
+            for z in (labels, text, init, cond_frames):
+                if z is not None:
+                    batch_size = z.shape[0]
+                    break
         if labels is None and cfg.num_classes:
             labels = torch.full((batch_size,), cfg.num_classes, device=device)
+        if not cfg.num_classes:
+            labels = None
         b = labels.shape[0] if labels is not None else batch_size
-        n = cfg.num_patches
+        if num_frames > 1 and not cfg.supports_video:
+            raise ValueError(f"this model generates {cfg.modalities} only; it was not built for video")
+        if num_frames == 1 and not cfg.supports_image:
+            raise ValueError("this is a video-only model; ask for num_frames > 1")
+        if not 0 < strength <= 1:
+            raise ValueError("strength must be in (0, 1]")
+        if init is not None:
+            height, width = init.shape[-2:]
+        elif cond_frames is not None:
+            height, width = cond_frames.shape[-2:]
+        height = cfg.image_size if height is None else height
+        width = cfg.image_size if width is None else width
+        if height % cfg.patch_size or width % cfg.patch_size:
+            raise ValueError(f"height and width must be multiples of patch_size={cfg.patch_size}")
+        grid = (num_frames, height // cfg.patch_size, width // cfg.patch_size)
+        n = grid[0] * grid[1] * grid[2]
+        if text is not None and text_pool is None:
+            raise ValueError("text needs text_pool")
+        if cfg.text_dim and text is not None and negative_text is None:
+            negative_text = self.model.null_text.expand(b, -1, -1)
+            negative_text_pool = self.model.null_text_pool.expand(b, -1)
+        null_labels = None if labels is None else torch.full_like(labels, cfg.num_classes)
+        cond = dict(grid=grid, labels=labels, text=text, text_pool=text_pool,
+                    uncond_labels=null_labels, uncond_text=negative_text, uncond_text_pool=negative_text_pool)
         max_rate = cfg.max_rate if max_rate is None else max_rate
         # A reused token's next step is first order (its history has a gap), so reuse keeps the first-order floor
         reuse_floor = 16 if min_token_steps is None else min_token_steps
@@ -628,7 +784,17 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         if min_token_steps > k0:
             max_rate = max(1.0, min(max_rate, (steps - k0) / (min_token_steps - k0)))
         x = torch.randn(b, n, cfg.patch_dim, device=device, generator=generator, dtype=self.dtype)
-        progress = torch.zeros(b, n, device=device)
+        shift = cfg.time_shift if time_shift is None else time_shift
+        to_t = lambda q: shift_time(1 - q, shift)  # noqa: E731
+        span = 1.0 if init is None else float(strength)  # share of the trajectory that is run
+        progress = torch.full((b, n), 1.0 - span, device=device)
+        if init is not None:
+            start = to_t(progress)[..., None].to(x.dtype)
+            x = (1 - start) * patchify(init.to(device, x.dtype), cfg.patch_size) + start * x
+        if cond_frames is not None:
+            given = patchify(cond_frames.to(device, x.dtype), cfg.patch_size)
+            x[:, : given.shape[1]] = given
+            progress[:, : given.shape[1]] = 1.0
         log_error = torch.zeros(b, n, device=device)
         x0 = torch.zeros_like(x)  # each token's latest clean-patch estimate
         prev_x0, prev_h = torch.zeros_like(x), torch.full((b, n), float("nan"), device=device)
@@ -641,8 +807,6 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         if guidance_interval is None:
             guidance_interval = (cfg.guidance_min_t, cfg.guidance_max_t)
         guidance = (guidance_scale, guidance_interval, tuple(uncond_skip_layers), guide_model, guidance_schedule, cfg_zero)
-        shift = cfg.time_shift if time_shift is None else time_shift
-        to_t = lambda q: shift_time(1 - q, shift)
         evaluated, noise_masks, update_masks = 0, [to_t(progress)], []
         for k in range(steps):
             moving = progress < 1
@@ -655,14 +819,14 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
                 rank = torch.full_like(progress, 0.5)
             shaping = k > 0 and k >= warmup * steps
             rate = max_rate ** (1 - rank) if adaptive and shaping else torch.ones_like(progress)
-            target = (progress + rate / steps).clamp(max=1) if k < steps - 1 else torch.ones_like(progress)
+            target = (progress + rate * span / steps).clamp(max=1) if k < steps - 1 else torch.ones_like(progress)
             need = moving | (just_finished if refresh_finished else torch.zeros_like(moving))
             if reuse and shaping and k < steps - 1:
                 # the surest moving tokens that were computed last step reuse that estimate instead (never twice in a
                 # row, never for the step that finishes them, and only while the token can still be run `reuse_floor`
                 # times if every later step computes it)
                 top = max_rate if adaptive else 1.0
-                fewest = torch.ceil((1 - progress) * steps / top - 1e-6).clamp(max=steps - k)  # steps left at top speed
+                fewest = torch.ceil((1 - progress) * steps / (span * top) - 1e-6).clamp(max=steps - k)  # steps left at top speed
                 candidate = moving & computed & (target < 1) & (evaluations + fewest - 1 >= reuse_floor)
                 skips = (reuse * moving.sum(-1, keepdim=True)).floor()
                 score = rank if reuse_by == "uncertainty" else torch.rand(b, n, device=device, generator=generator)
@@ -678,7 +842,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
             has_estimate = k > (1 if cfg_zero and guidance_scale != 1 else 0)  # the CFG-Zero* first step estimates nothing
             self_cond = gather_tokens(x0, index) if cfg.self_condition and has_estimate else None
             v, err = self._velocity_and_error(
-                x_a, t_a.to(x.dtype), labels, index, caches, guidance, self_cond, first_step=k == 0
+                x_a, t_a.to(x.dtype), cond, index, caches, guidance, self_cond, first_step=k == 0
             )
             x0 = scatter_tokens(x0, index, x_a - t_a[..., None].to(x.dtype) * v)
             log_error = scatter_tokens(log_error, index, err.float())
@@ -712,7 +876,9 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
             if return_masks:
                 update_masks.append(computed & moving)
                 noise_masks.append(to_t(progress))
-        images = unpatchify(x, cfg.patch_size, cfg.num_channels).clamp(-1, 1)
+        images = unpatchify(x, cfg.patch_size, cfg.num_channels, grid)
+        if cfg.vae_scale_factor == 1:  # pixel space; latents are left unclamped for the decoder
+            images = images.clamp(-1, 1)
         return HydroDiffGenerationOutput(
             images=images,
             compute=evaluated / (b * n * steps),
