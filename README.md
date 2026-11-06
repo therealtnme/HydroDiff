@@ -68,6 +68,39 @@ frame (each side is scaled to the nearest multiple of 32 pixels). `evaluate_text
 separate CLIP model: the CLIP score, and how often an image's own prompt ranks first (top-1) or in the top 5 of all
 prompts, against real photos and a flat mean-colour image as references.
 
+### What one epoch under 1 GB on a CPU gives
+
+One pass over 4,950 COCO photos (796 MB downloaded, 32 more held out), `hydrodiff-s` (5.2M parameters) with the
+defaults of `train_stream.py`, 67 minutes on an Intel i7-3770 (4 cores, no AVX2, no usable GPU). Prompt following on
+32 COCO test captions ([`test/RESEARCH.md`](test/RESEARCH.md), section 14):
+
+| | CLIP score | Prompt ranked first among 32 | s / image (16 steps) |
+| --- | --- | --- | --- |
+| real photos | 30.01 | 0.875 | - |
+| flat image of each photo's mean colour | 19.23 | 0.031 | - |
+| this model, default sampler | 17.06 | 0.031 (chance) | 2.3 |
+| this model, `guidance_scale=1` | 17.66 | 0.031 (chance) | 1.3 |
+
+**The model does not yet make useful images.** It denoises well (noised held-out photos come back coherent up to
+noise level 0.9), and the prompt sets the colours and coarse light/dark layout ("a snowy mountain" is blue-grey, "a
+pizza" orange-brown, the bus prompt darker above and blue below), but generated images have no objects and the 32x32
+patches do not join up. Generation from pure noise needs far more training than 2,505 steps on 4,950 images: the
+CIFAR-10 results below used 768,000 image presentations for a 32x32 class-conditional model.
+
+![Prompts (left to right, top to bottom): a red double decker bus driving down a city street, a plate of food with broccoli and rice, a giraffe standing in a grassy field, a white bathroom with a toilet and a sink, a sandy beach under a clear blue sky, a snowy mountain with skiers, a green field with cows grazing, a pizza on a wooden table](test/figures/coco_samples.png)
+
+What was measured to get here (each kept only if it paid for itself, section 14):
+
+| Change | Effect | Status |
+| --- | --- | --- |
+| Pixel space instead of the TAESD latent autoencoder | the autoencoder alone took 2.2-2.9 s to encode and 2.9 s to decode a photo on this CPU, more than a training step | pixels, `patch_size=32` |
+| JiT bottleneck patch embedding (`patch_embed_dim=128`) | 14% lower validation loss, 6% fewer parameters, same speed | default |
+| Batch 2 instead of 8 | 11% lower validation loss from the same images; better and faster than a twice-as-large model | default |
+| `time_shift=3` + `terminal_prob=0.1` (new) | 25% lower clean-image error at noise level 0.9-0.95, where layout is made; CLIP 17.1 against 15.6 | default |
+| fp16 weights on disk | half the storage (134 MB for the whole pipeline), images differ by 0.12 of an 8-bit level | default for saved pipelines |
+| Row-group streaming with range requests | about 2 GB peak memory instead of 3.2 GB and growing, and an exact count of downloaded bytes | default |
+| `hydrodiff-b`, bf16, 8 threads | 1.75x slower for 6%; 14x slower; no faster than 2-4 threads | dropped |
+
 ## Results
 
 Every idea was measured on CIFAR-10 (32x32, class-conditional) with the 3M-parameter `hydrodiff-s`, trained on CPUs for 4,000 and 12,000 steps. Quality is FID against 10,000 training images; compute is the number of token evaluations relative to a dense sampler with the same steps. All tables are in [`test/RESEARCH.md`](test/RESEARCH.md).
@@ -332,7 +365,7 @@ Run:
 python example_generate.py
 ```
 
-The example loads a HydroDiff checkpoint, selects CUDA when available, and writes a grid of images for each CIFAR-10 class name that you type.
+The example loads a pipeline folder (text prompts; `image: photo.jpg | prompt` adds an image, `frames: 16 | prompt` asks a video model for a GIF) or a class-conditional CIFAR-10 checkpoint (class names), selects CUDA when available, and saves what it generates.
 
 ## Repository Structure
 
@@ -342,18 +375,22 @@ HydroDiff/
 │   ├── __init__.py
 │   ├── configuration_hydrodiff.py
 │   ├── modeling_hydrodiff.py
-│   └── optimization_hydrodiff.py
+│   ├── optimization_hydrodiff.py
+│   └── pipeline_hydrodiff.py
 ├── test/
 │   ├── RESEARCH.md
 │   ├── figures/
 │   ├── setup_bench.sh
 │   ├── prepare_cifar10.py
 │   ├── train.py
+│   ├── train_stream.py
+│   ├── evaluate_text.py
 │   ├── validate.py
 │   ├── evaluate.py
 │   ├── sampler_study.py
 │   ├── mask_analysis.py
-│   └── test_hydrodiff.py
+│   ├── test_hydrodiff.py
+│   └── test_multimodal.py
 ├── example_generate.py
 ├── LICENSE
 └── README.md

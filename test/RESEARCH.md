@@ -656,6 +656,71 @@ optimizer and the text encoder call), not from the model.
 After 960 images (150-495 steps) none of the runs follows its prompt: the CLIP top-1 rank of the prompt among 32
 is at chance, and the images are per-patch colour tiles without structure across patches.
 
+### First full run (shift 1): one epoch of 4,950 images
+
+0.9 GB payload budget: five row groups (796 MB downloaded; the sixth would have passed the budget), 32 images held
+out, 4,950 trained once in 2,505 steps (batch 2), 61 minutes at 1.36 images/s on 4 threads. Validation loss 0.571
+(EMA) against 0.674 (raw weights): the EMA is the better model. Prompt following on 32 COCO test captions, at the
+photos' own sizes (real photos: CLIP score 30.01, top-1 0.875; a flat image of each photo's mean colour: 19.23):
+
+| Sampler (16 steps unless noted) | CLIP score | Top-1 | Top-5 | s / image | Compute |
+| --- | --- | --- | --- | --- | --- |
+| default (noise mask, guidance 3 on 0.2-0.85) | 15.57 | 0.031 | 0.125 | 3.99 | 0.87 |
+| raw weights | 15.77 | 0.031 | 0.188 | - | 0.87 |
+| no guidance | 15.07 | 0.031 | 0.125 | 2.57 | 0.87 |
+| guidance 2 | 15.34 | 0.031 | 0.125 | 3.74 | 0.87 |
+| dense (`adaptive=False`) | 15.52 | 0.031 | 0.156 | 4.11 | 1.00 |
+| 32 steps, `reuse=0.25` | 15.71 | 0.031 | 0.156 | 6.54 | 0.69 |
+
+Every setting is at chance (top-1 1/32 = 0.031): the images have natural colours but no layout across patches.
+
+**Diagnosis.** One-step clean-image estimates of noised held-out photos are good up to `t = 0.9` (coherent
+photos at `t = 0.3-0.6`, the right blocky layout at `t = 0.9`) but noise-like at `t = 1`. Relative to guessing each
+photo's mean colour (1 = no better):
+
+| Model (batch 2) | t = 0.5 | t = 0.9 | t = 0.95 | t = 1 |
+| --- | --- | --- | --- | --- |
+| shift 1, 960 images | 0.217 | 0.662 | 1.016 | 1.490 |
+| shift 1, full run (4,950 images) | 0.178 | 0.446 | 0.780 | 1.439 |
+| shift 2, 960 images | 0.227 | 0.556 | 0.911 | 1.739 |
+| shift 3, 960 images | 0.240 | 0.517 | 0.796 | 1.594 |
+| shift 3 + `terminal_prob=0.05`, 960 images | 0.267 | 0.537 | 0.845 | 1.298 |
+| **shift 3 + `terminal_prob=0.1`, 960 images** | 0.258 | **0.498** | **0.781** | **1.289** |
+
+Five times the data barely moves the error at `t = 1`. Two causes: at 640x480 an image at `t = 0.9` still shows most
+of its layout, so the logit-normal schedule (which samples `t > 0.95` 0.2% of the time) almost never trains the stage
+where layout is made - a resolution shift moves training there (shift 3: 22% lower error at `t = 0.95` from the same
+960 images); and no schedule ever samples `t = 1` itself, the state the sampler starts from, so the first estimate,
+which sets the layout, maps noise to noise-like patches (the zero-terminal-SNR problem). The uniform validation loss
+missed this (it rated shift 2 worse), which is why the earlier shift-2 run was dropped; the trainer now also logs the
+error at `t = 0.9` and `t = 1`.
+
+`terminal_prob` (new) gives that share of the training images pure noise. With shift 3 and 10% it is the best at every
+high noise level (25% lower error at `t = 0.9`, 23% at `t = 0.95` and 13% at `t = 1` than shift 1) for no extra
+compute; the cost is at `t = 0.5`, the detail stage. Its samples from the same 960 images are the first whose colours
+follow the prompt (grey-white for "a snowy mountain", orange-brown for "a pizza"), still without layout across
+patches. Both are the streaming trainer's defaults; the class default of `terminal_prob` stays 0 so the CIFAR-10
+results above are unchanged.
+
+### Final run: shift 3 + `terminal_prob=0.1`
+
+The same data and budget as the first full run (4,950 images trained once, 796 MB downloaded, 67 minutes):
+
+| Full run | t = 0.5 | t = 0.9 | t = 0.95 | t = 1 | CLIP (guidance 3) | CLIP (no guidance) | Top-1 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| shift 1 | 0.178 | 0.446 | 0.780 | 1.439 | 15.57 | 15.07 | 0.031 |
+| **shift 3 + terminal 0.1** | 0.222 | **0.438** | **0.578** | **1.287** | **17.06** | **17.66** | 0.031 |
+
+(Clean-image errors relative to each photo's mean colour on the 32 COCO test photos. At `t = 1` the model knows only
+the prompt, so even a perfect model stays above 1 against this per-photo oracle.) Guidance 3 no longer helps at this
+stage (17.06 against 17.66 without, for 1.7 times the time per image), but the CIFAR-10 result for guidance is from
+far longer training, so the default stays. The prompt now sets colours and coarse layout, but prompt ranking is
+still at chance and the CLIP score below that of a flat mean-colour image: one epoch of 4,950 photos is far from
+enough for a model that generates objects. The next levers, in order of expected value per CPU hour, are more images
+(each one still lowers the high-noise error), then a larger model once there are enough images to use it.
+
+![One-step estimates of noised COCO test photos from the shift-1 run: real, then noisy and estimated at t = 0.3, 0.6, 0.9 and 1](figures/coco_denoise.png)
+
 ## Prior work
 
 The three ideas each have close relatives in recent work. The review (2022-2026) shaped the design:

@@ -225,7 +225,9 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     overrides = {k: parse_value(v) for k, v in (kv.split("=", 1) for kv in args.set)}
     # measured on 960 COCO images: the JiT bottleneck embedding is 14% lower in validation loss, 6% smaller, as fast
-    defaults = dict(image_size=512, patch_size=32, patch_embed_dim=128, num_classes=0, text_dim=512, modalities=["image"])
+    # time_shift=3 + terminal_prob=0.1: 22-35% lower clean-image error at t = 0.9-1, where layout is made (section 14)
+    defaults = dict(image_size=512, patch_size=32, patch_embed_dim=128, num_classes=0, text_dim=512, modalities=["image"],
+                    time_shift=3, terminal_prob=0.1)
     config = HydroDiffConfig.from_preset(args.preset, **{**defaults, **overrides})
     model = HydroDiffForImageGeneration(config).train()
     ema = copy.deepcopy(model).eval().requires_grad_(False)
