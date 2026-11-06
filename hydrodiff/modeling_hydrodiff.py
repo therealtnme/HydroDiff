@@ -500,7 +500,11 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         hetero = torch.rand(batch, 1, device=device, generator=generator) < cfg.hetero_prob
         rate = torch.where(hetero, rate, torch.ones_like(rate))
         progress = q + (rate - 1) * (q - cfg.hetero_start).clamp_min(0)
-        return shift_time((1 - progress).clamp(0, 1), cfg.time_shift)
+        t = shift_time((1 - progress).clamp(0, 1), cfg.time_shift)
+        if cfg.terminal_prob:  # pure noise: where sampling starts
+            terminal = torch.rand(batch, 1, device=device, generator=generator) < cfg.terminal_prob
+            t = torch.where(terminal, torch.ones_like(t), t)
+        return t
 
     def velocity(self, prediction: torch.Tensor, noisy_tokens: torch.Tensor, timesteps: torch.Tensor, min_t: float = 0.0):
         if self.config.prediction_type == "v":

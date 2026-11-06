@@ -32,6 +32,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hydrodiff import HydroDiffConfig, HydroDiffForImageGeneration  # noqa: E402
+from hydrodiff.modeling_hydrodiff import patchify  # noqa: E402
 from hydrodiff.optimization_hydrodiff import build_optimizers, lr_factor, set_lr_factor  # noqa: E402
 from hydrodiff.pipeline_hydrodiff import HydroDiffPipeline, pil_to_tensor  # noqa: E402
 
@@ -170,6 +171,30 @@ def validation_loss(model, val, seed=1234):
     return results
 
 
+@torch.no_grad()
+def high_noise_error(model, val, levels=(0.9, 1.0), seed=4321):
+    """
+    One-step clean-image error at high noise levels, relative to guessing each image's mean colour (1 = no better).
+    This is the stage that decides the layout of a generated image; the uniform validation loss hardly sees it.
+    """
+    was_training = model.training
+    model.eval()
+    g = torch.Generator().manual_seed(seed)
+    out = {}
+    for level in levels:
+        total = 0.0
+        for x, text, pool in val:
+            x0 = patchify(x[None], model.config.patch_size)
+            grid = (1, x.shape[-2] // model.config.patch_size, x.shape[-1] // model.config.patch_size)
+            noise = torch.randn(x0.shape, generator=g)
+            t = torch.full(x0.shape[:2], level)
+            pred = model.model((1 - level) * x0 + level * noise, t, grid=grid, text=text, text_pool=pool).prediction
+            total += ((pred - x0).pow(2).mean() / (x0 - x0.mean((1, 2), keepdim=True)).pow(2).mean()).item()
+        out[f"x0_err_t{level}"] = round(total / len(val), 4)
+    model.train(was_training)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="Multimodal-Fatima/COCO_captions_train")
@@ -274,7 +299,7 @@ def main():
         minutes = (time.time() - start) / 60
         rec = dict(step=step, images=images_done, mb=round(downloaded[0] / 1e6, 1), minutes=round(minutes, 2),
                    train=float(np.mean(seen_loss)) if seen_loss else None, val_uniform=uniform, val_mixed=mixed,
-                   imgs_per_sec=round(images_done / max(1e-9, minutes * 60), 3))
+                   imgs_per_sec=round(images_done / max(1e-9, minutes * 60), 3), **high_noise_error(ema, val))
         if final:
             rec.update(final=True, raw_val_uniform=raw_uniform, params=params)
         seen_loss.clear()

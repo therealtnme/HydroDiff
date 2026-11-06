@@ -57,6 +57,10 @@ class HydroDiffConfig(PreTrainedConfig):
         timestep_mean (`float`): Mean of the logit-normal training noise level (0: centred on t = 0.5; positive
             values train more at high noise, as MOSS-Image does).
         hetero_prob (`float`): Fraction of training images whose tokens get different noise levels.
+        terminal_prob (`float`): Fraction of training images given pure noise (`t = 1` for every token) - the state
+            the sampler starts from, which the logit-normal schedule never samples. At pure noise the best clean-image
+            estimate is the prompt's average image; without these images the model maps noise to noise-like patches
+            and the first step, which sets the layout, is wrong.
         hetero_start (`float`): Progress (0 = pure noise, 1 = clean) from which those tokens' speeds differ. Matching
             the sampler's `warmup` keeps training on the states the sampler produces and nothing else.
         max_rate (`float`): Largest per-token speed-up, both in training (the spread of noise levels) and at sampling.
@@ -116,6 +120,7 @@ class HydroDiffConfig(PreTrainedConfig):
     time_shift: float | int = 1.0
     timestep_mean: float | int = 0.0
     hetero_prob: float | int = 0.25
+    terminal_prob: float | int = 0.0
     hetero_start: float | int = 0.25
     max_rate: float | int = 2.0
     uncertainty_loss_weight: float | int = 0.1

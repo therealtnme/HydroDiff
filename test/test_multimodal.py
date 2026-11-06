@@ -253,3 +253,13 @@ def test_stream_counts_bytes_and_stops_before_the_budget(tmp_path):
     ]
     x, nbytes = decode(got[3], multiple=8)
     assert x.dtype == torch.uint8 and x.shape == (3, 32, 40) and nbytes == len(rows[3]["image"]["bytes"])
+
+
+def test_terminal_prob_trains_some_images_at_pure_noise():
+    model = make(terminal_prob=1.0).train()
+    t = model.sample_timesteps(4, "cpu", num_tokens=16)
+    assert torch.equal(t, torch.ones(4, 16))
+    assert (make().sample_timesteps(64, "cpu", num_tokens=16) < 1).all()  # off by default: logit-normal never hits 1
+    text, pool = prompts(4)
+    out = model(torch.rand(4, 3, 16, 16) * 2 - 1, text=text, text_pool=pool)
+    assert torch.isfinite(out.loss)
