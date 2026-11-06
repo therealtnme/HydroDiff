@@ -211,3 +211,45 @@ def test_pipeline_text_image_video_modes():
     assert out.images[0].size == (20, 12)
     out = pipe("move", image=photo, num_frames=3, num_inference_steps=4)
     assert len(out.frames) == 1 and len(out.frames[0]) == 3 and out.frames[0][0].size == (20, 12)
+
+
+def test_stream_counts_bytes_and_stops_before_the_budget(tmp_path):
+    import io
+    import os
+    import sys
+
+    import fsspec
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from PIL import Image
+
+    sys.path.insert(0, "test")
+    from train_stream import captions_of, decode, stream
+
+    def jpeg(i):
+        buffer = io.BytesIO()
+        Image.new("RGB", (40 + i, 30), (i * 20, 0, 0)).save(buffer, "JPEG")
+        return buffer.getvalue()
+
+    # an incompressible unused column, and a file well past pyarrow's 64 KB speculative footer read
+    rows = [dict(image=dict(bytes=jpeg(i), path=None), sentences_raw=str([f"photo {i}", "x"]), extra=os.urandom(40000))
+            for i in range(10)]
+    folder = tmp_path / "datasets" / "toy" / "data"
+    folder.mkdir(parents=True)
+    pq.write_table(pa.Table.from_pylist(rows), folder / "train-00000-of-00001.parquet", row_group_size=4)
+    fs, root = fsspec.filesystem("file"), str(tmp_path / "datasets").replace("\\", "/")
+
+    counter = [0]
+    got = list(stream("toy", "train", float("inf"), counter, fs=fs, root=root))
+    assert [captions_of(r)[0] for r in got] == [f"photo {i}" for i in range(10)]
+    assert "extra" not in got[0]  # only the image and caption columns are fetched
+    full = counter[0]
+    assert full < 0.5 * (folder / "train-00000-of-00001.parquet").stat().st_size  # the unused column was never read
+    counter = [0]
+    some = list(stream("toy", "train", full - 1, counter, fs=fs, root=root))
+    assert len(some) == 8 and counter[0] <= full - 1  # the last row group (2 rows) would pass the budget: not fetched
+    assert [captions_of(r)[0] for r in stream("toy", "train", float("inf"), [0], skip_rows=6, fs=fs, root=root)] == [
+        f"photo {i}" for i in range(6, 10)
+    ]
+    x, nbytes = decode(got[3], multiple=8)
+    assert x.dtype == torch.uint8 and x.shape == (3, 32, 40) and nbytes == len(rows[3]["image"]["bytes"])

@@ -608,6 +608,54 @@ Patch size, at 4,000 steps (a separate pair of runs; FID is higher at this train
 * The EMA row is the run in which the extra EMAs were capped by a shared warmup (fixed in `train.py`); it compares
   0.999 with 0.99925 only.
 
+## 14. Text-to-image on streamed COCO photos (one epoch, CPU)
+
+Setting: one pass over COCO captions (`Multimodal-Fatima/COCO_captions_train`) streamed from the Hub with
+`test/train_stream.py`, photos at full size (longest side 640 pixels, no crop), frozen CLIP ViT-B/32 text encoder,
+`hydrodiff-s` with `patch_size=32` in pixel space. The machine is an Intel i7-3770 (4 cores, no AVX2, so PyTorch runs
+its generic CPU kernels) with no usable GPU. The A/B runs below each train on the same first 960 images (one 165 MB
+parquet row group, 32 more images held out for validation) and run two at a time with 2 threads each. Validation
+loss is on fixed held-out images, noise and noise levels (EMA weights).
+
+### Rules for keeping a change
+
+A change that costs speed, memory or storage is kept only if it buys accuracy that nothing cheaper buys; a change that
+costs accuracy is kept only if nothing else can win it back.
+
+### Where the computation goes
+
+| Measurement | Result | Decision |
+| --- | --- | --- |
+| TAESD latent space (tiny SD autoencoder) | encode 2.2-2.9 s and decode 2.9 s per 640x480 photo on this CPU, more than the whole training step (0.43-0.59 s) | pixel space with 32x32 patches: no autoencoder to run, store or load |
+| bf16 autocast | 14 times slower (6.0 s against 0.43 s per image): no native bf16 on this CPU | fp32 |
+| threads | 2 threads 0.445 s, 4 threads 0.427 s, 8 threads 0.412 s per image (memory-bound) | 2 threads per A/B run, two runs at a time |
+| `torch.compile` | needs a C++ compiler, none installed | not used |
+| streaming memory | `datasets` streaming: 3.2 GB per process and growing; row-group reader with range requests: about 2 GB peak | row-group reader (also counts every downloaded byte) |
+| buffered images | float32 pixels: 3.7 MB per photo; uint8: 0.9 MB | uint8 until the step that trains on them |
+| fp16 weights on disk | 20.7 to 10.3 MB (transformer), 246 to 123 MB (text encoder); generated images differ by 0.12 of an 8-bit level on average | fp16 storage, fp32 compute |
+
+The byte count of the row-group reader agrees with the network adapter within the HTTP/TLS overhead (165.2 MB counted,
+180.8 MB received by the whole machine), so the full run uses a 0.9 GB payload budget to stay under 1 GB of traffic.
+
+### A/B runs (960 images each)
+
+| Run | Params | Steps | Val loss | Val loss (mixed levels) | Images / s | Decision |
+| --- | --- | --- | --- | --- | --- | --- |
+| baseline (full patch embedding, batch 8) | 5.51M | 150 | 1.027 | 3.29 | 1.27 | - |
+| JiT bottleneck `patch_embed_dim=128` | 5.17M | 150 | 0.879 | 2.98 | 1.28 | kept: 14% better, 6% smaller, as fast |
+| + `time_shift=2` | 5.17M | 150 | 1.190 | 3.60 | 1.25 | dropped: no gain in CLIP score at chance level (16.2 against 14.5, both below a flat-colour image) |
+| `hydrodiff-b` + bottleneck | 10.13M | 150 | 0.830 | 2.87 | 0.73 | dropped: 6% better for 1.75 times the compute and twice the storage; batch 2 is better and faster |
+| bottleneck, batch 4 | 5.17M | 263 | 0.904 | 2.90 | 1.03 | - (level with batch 8 within noise) |
+| **bottleneck, batch 2** | 5.17M | 495 | **0.782** | **2.74** | 0.87 | kept: 11% better than batch 8 |
+
+With one epoch the data, not the compute, is the scarce resource, and more optimizer steps per image is the cheapest
+way to learn more from it: batch 2 beats the twice-as-large model on both accuracy and speed. Its cost (1.5 times the
+time per image of batch 8) comes from the fixed per-step work (Muon's orthogonalisation of every weight matrix, the
+optimizer and the text encoder call), not from the model.
+
+After 960 images (150-495 steps) none of the runs follows its prompt: the CLIP top-1 rank of the prompt among 32
+is at chance, and the images are per-patch colour tiles without structure across patches.
+
 ## Prior work
 
 The three ideas each have close relatives in recent work. The review (2022-2026) shaped the design:

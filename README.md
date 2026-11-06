@@ -8,6 +8,66 @@ The project explores compute-efficient image generation through a **predicted no
 
 HydroDiff is designed to remain compatible with the Transformers ecosystem (`PreTrainedModel`, `save_pretrained`, `from_pretrained`) while adding dynamic computation to the sampler.
 
+## Text and image to image and video
+
+From the outside HydroDiff works like other generative pipelines:
+
+```python
+from hydrodiff.pipeline_hydrodiff import HydroDiffPipeline, export_to_gif
+
+pipe = HydroDiffPipeline.from_pretrained("runs/coco/pipeline")
+image = pipe("a red double decker bus on a city street").images[0]           # text -> image
+image = pipe("the same street in winter", image=photo, strength=0.6).images[0] # text + image -> image
+frames = pipe("waves rolling onto a beach", num_frames=16).frames[0]          # text -> video (video models)
+frames = pipe("the dog starts to run", image=photo, num_frames=16).frames[0]  # text + image -> video
+export_to_gif(frames, "video.gif")
+```
+
+`height` and `width` take any size (rounded to the nearest multiple of one patch), `negative_prompt`, `guidance_scale`,
+`num_inference_steps`, `num_images_per_prompt` and `generator` work as usual, and every sampler option of
+`generate` (`reuse`, `adaptive`, `solver`, `min_token_steps`, ...) can be passed through.
+
+What a model can do is fixed by what it was built and trained for, `config.modalities`:
+
+| `modalities` | Text -> image | Text + image -> image | Text -> video | Text + image -> video |
+| ------------ | :-----------: | :-------------------: | :-----------: | :-------------------: |
+| `["image"]` | yes | yes (`strength`) | refused | refused |
+| `["video"]` | refused | refused | yes | yes (first frame) |
+| `["image", "video"]` | yes | yes | yes | yes |
+
+Inside, nothing changes from the image model: every token still has its own noise level, the noise mask finishes sure
+tokens early, the update mask removes finished tokens from the computation, and self-conditioning and interval guidance
+are on. The additions reuse those parts:
+
+* **Text** comes from a frozen CLIP text encoder. Its pooled embedding joins the per-token modulation, and its tokens
+  are extra keys and values of every attention layer. Queries stay image tokens only, so the update mask still removes
+  the whole cost of a finished token. Training swaps 10% of the prompts for a learned null prompt, which is the
+  reference of classifier-free guidance (no extra text-encoder pass for the empty prompt).
+* **Any size, no crop.** Rotary positions follow the actual grid of each image, so one model trains and samples at many
+  sizes and aspect ratios. Training batches images of the same size together instead of cropping or padding.
+* **Video** is a stack of frames with a third rotary axis for time (`modalities` containing `"video"`); an image is a
+  one-frame video.
+* **Image conditioning needs no new parameters.** HydroDiff already treats tokens at noise level 0 as clean context that
+  is computed once, cached and never trained on. Image-to-video gives the first frame at `t = 0` (trained on
+  `image_cond_prob` of the clips); image-to-image starts every token at noise level `strength` and runs only that part
+  of the trajectory.
+* **Pixels or latents.** Models work on pixel patches by default (`patch_size=32` for photos, with the JiT bottleneck
+  `patch_embed_dim=128`); a checkpoint with a `vae/` folder and `vae_scale_factor > 1` works on its latents instead.
+
+### Training on a streamed caption dataset
+
+```bash
+python test/train_stream.py --out runs/coco --text-encoder models/clip-vit-base-patch32-text --max-bytes 0.9e9 --save-pipeline
+python test/evaluate_text.py --pipeline runs/coco/pipeline --clip models/clip-vit-base-patch32 --n 32 --grid grid.png
+```
+
+`train_stream.py` makes one pass (one epoch) over a Hugging Face parquet dataset streamed straight from the Hub. It
+reads one row group at a time with range requests, fetches only the image and caption columns, writes nothing to disk,
+and counts every byte it downloads; it stops before the row group that would pass `--max-bytes`. Images keep their full
+frame (each side is scaled to the nearest multiple of 32 pixels). `evaluate_text.py` judges prompt following with a
+separate CLIP model: the CLIP score, and how often an image's own prompt ranks first (top-1) or in the top 5 of all
+prompts, against real photos and a flat mean-colour image as references.
+
 ## Results
 
 Every idea was measured on CIFAR-10 (32x32, class-conditional) with the 3M-parameter `hydrodiff-s`, trained on CPUs for 4,000 and 12,000 steps. Quality is FID against 10,000 training images; compute is the number of token evaluations relative to a dense sampler with the same steps. All tables are in [`test/RESEARCH.md`](test/RESEARCH.md).
