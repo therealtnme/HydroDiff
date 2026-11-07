@@ -485,13 +485,15 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
 
     # ---------------------------------------------------------------------------------------------------- training
 
-    def sample_timesteps(self, batch: int, device, generator=None, num_tokens: int | None = None) -> torch.Tensor:
+    def sample_timesteps(self, batch: int, device, generator=None, num_tokens: int | None = None,
+                         tokens_per_frame: int | None = None) -> torch.Tensor:
         """
         Per-token noise levels for training. Each image gets a logit-normal progress `q` (how far denoising has got;
         `timestep_mean` > 0 moves it towards high noise).
         A `hetero_prob` share of images also gets a per-token speed `r` in [1, max_rate] from progress `hetero_start`
         on, so a token's progress is `q + (r - 1) * (q - hetero_start)`: the states the adaptive sampler produces, where
         confident tokens are ahead of (cleaner than) the rest once its warmup is over.
+        `tokens_per_frame` sets the schedule shift under dynamic resolution (default: `num_tokens`).
         """
         cfg = self.config
         n = cfg.num_patches if num_tokens is None else num_tokens
@@ -500,7 +502,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         hetero = torch.rand(batch, 1, device=device, generator=generator) < cfg.hetero_prob
         rate = torch.where(hetero, rate, torch.ones_like(rate))
         progress = q + (rate - 1) * (q - cfg.hetero_start).clamp_min(0)
-        t = shift_time((1 - progress).clamp(0, 1), cfg.time_shift)
+        t = shift_time((1 - progress).clamp(0, 1), cfg.shift_for(n if tokens_per_frame is None else tokens_per_frame))
         if cfg.terminal_prob:  # pure noise: where sampling starts
             terminal = torch.rand(batch, 1, device=device, generator=generator) < cfg.terminal_prob
             t = torch.where(terminal, torch.ones_like(t), t)
@@ -539,7 +541,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         x0 = patchify(pixel_values, cfg.patch_size)
         b, n = x0.shape[:2]
         if timesteps is None:
-            timesteps = self.sample_timesteps(b, x0.device, num_tokens=n)
+            timesteps = self.sample_timesteps(b, x0.device, num_tokens=n, tokens_per_frame=grid[1] * grid[2])
             if frames > 1 and self.training and cfg.image_cond_prob:
                 # image-to-video: the first frame is given clean - context for the rest, not a target
                 first = torch.rand(b, 1, device=x0.device) < cfg.image_cond_prob
@@ -720,7 +722,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         `guidance_scale=1` for unguided sampling at half the cost); `guidance_schedule="linear"` raises the scale from 1 at pure noise to
         `2 * guidance_scale - 1` at the clean end (same mean); `cfg_zero=True` applies CFG-Zero* (the reference is
         scaled by its projection on the conditional velocity, and the first step is skipped). `time_shift` overrides
-        the configuration's schedule shift.
+        the configuration's schedule shift (by default it follows the image size when `time_shift_base_tokens` is set).
 
         `reuse` > 0 widens the update mask: that share of the moving tokens - the surest ones - skips the network in a
         step and moves with its estimate from the step before (never twice in a row, never on its last step);
@@ -788,7 +790,7 @@ class HydroDiffForImageGeneration(HydroDiffPreTrainedModel):
         if min_token_steps > k0:
             max_rate = max(1.0, min(max_rate, (steps - k0) / (min_token_steps - k0)))
         x = torch.randn(b, n, cfg.patch_dim, device=device, generator=generator, dtype=self.dtype)
-        shift = cfg.time_shift if time_shift is None else time_shift
+        shift = cfg.shift_for(grid[1] * grid[2]) if time_shift is None else time_shift
         to_t = lambda q: shift_time(1 - q, shift)  # noqa: E731
         span = 1.0 if init is None else float(strength)  # share of the trajectory that is run
         progress = torch.full((b, n), 1.0 - span, device=device)

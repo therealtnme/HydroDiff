@@ -14,6 +14,9 @@ the patch size, at most half a patch).
 * Validation: the first `--val-size` streamed images are held out (never trained on); fixed noise and noise levels,
   as in test/train.py.
 * Running the same command again resumes from the last saved state (images still buffered at that moment are skipped).
+* `--init runs/coco/state.pt` fine-tunes a trained run on the rows after the ones it read (new photos only, so every
+  image is still seen once), with its validation images, weights, EMA and optimizer state; `--set` changes options.
+* `--minutes` stops after that much training time (the learning-rate schedule plans its decay from the measured speed).
 """
 
 import argparse
@@ -200,7 +203,9 @@ def main():
     ap.add_argument("--dataset", default="Multimodal-Fatima/COCO_captions_train")
     ap.add_argument("--split", default="train")
     ap.add_argument("--val-size", type=int, default=32)
-    ap.add_argument("--max-bytes", type=float, default=1e9, help="bytes downloaded, validation included")
+    ap.add_argument("--max-bytes", type=float, default=float("inf"), help="cap on bytes streamed, validation included")
+    ap.add_argument("--minutes", type=float, default=0, help="stop after this many minutes of training (0: no limit)")
+    ap.add_argument("--init", default=None, help="state.pt of a trained run to fine-tune on the rows after it")
     ap.add_argument("--limit-images", type=int, default=0, help="stop after this many training images (0: no limit)")
     ap.add_argument("--text-encoder", required=True)
     ap.add_argument("--preset", default="hydrodiff-s")
@@ -226,9 +231,16 @@ def main():
     overrides = {k: parse_value(v) for k, v in (kv.split("=", 1) for kv in args.set)}
     # measured on 960 COCO images: the JiT bottleneck embedding is 14% lower in validation loss, 6% smaller, as fast
     # time_shift=3 + terminal_prob=0.1: 22-35% lower clean-image error at t = 0.9-1, where layout is made (section 14)
+    # time_shift_base_tokens=300: the shift of 3 belongs to a COCO-sized photo (640 x 480 = 300 tokens) and grows with
+    # the square root of the size (dynamic resolution, section 15)
     defaults = dict(image_size=512, patch_size=32, patch_embed_dim=128, num_classes=0, text_dim=512, modalities=["image"],
-                    time_shift=3, terminal_prob=0.1)
-    config = HydroDiffConfig.from_preset(args.preset, **{**defaults, **overrides})
+                    time_shift=3, terminal_prob=0.1, time_shift_base_tokens=300)
+    init = torch.load(args.init, weights_only=False) if args.init else None
+    fine_tune = init is not None
+    if init is not None:  # the trained run's own configuration, with --set changes
+        config = HydroDiffConfig.from_pretrained(os.path.join(os.path.dirname(args.init), "ema"), **overrides)
+    else:
+        config = HydroDiffConfig.from_preset(args.preset, **{**defaults, **overrides})
     model = HydroDiffForImageGeneration(config).train()
     ema = copy.deepcopy(model).eval().requires_grad_(False)
     optimizers = build_optimizers(model, lr=args.lr, weight_decay=0.0, optimizer="muon", muon_lr=args.muon_lr)
@@ -252,6 +264,17 @@ def main():
         rng.setstate(state["rng"])
         torch.set_rng_state(state["torch_rng"])
         print(f"resumed at step {step}, row {rows}", flush=True)
+    elif init is not None:
+        model.load_state_dict(init["model"])
+        ema.load_state_dict(init["ema"])
+        for opt, s in zip(optimizers, init["optimizers"]):
+            base = [g["base_lr"] for g in opt.param_groups]
+            opt.load_state_dict(s)  # moments only: the learning rates are this run's --lr / --muon-lr
+            for g, lr in zip(opt.param_groups, base):
+                g["base_lr"] = g["lr"] = lr
+        rows, val = init["rows"], init["val"]  # new rows only; the same held-out images
+        print(f"fine-tuning {args.init} from row {rows}", flush=True)
+    del init
 
     log = open(os.path.join(args.out, "log.jsonl"), "a")
     start = time.time() - elapsed0
@@ -259,6 +282,9 @@ def main():
     buffered, seen_loss = 0, []
 
     def planned_steps():
+        if args.minutes:  # from the speed so far (after warmup the schedule is flat until the last 20%)
+            spent = time.time() - start
+            return max(step + 1, int(step * args.minutes * 60 / spent)) if step >= args.warmup else 10**9
         if args.limit_images:
             total = args.limit_images
         else:
@@ -272,7 +298,8 @@ def main():
         text, pool = encoder([b[1] for b in batch])
         flip = torch.rand(len(batch)) < 0.5  # horizontal flips (captions rarely depend on left/right)
         x = torch.where(flip[:, None, None, None], x.flip(-1), x)
-        set_lr_factor(optimizers, lr_factor(step, planned_steps(), args.warmup, "wsd"))
+        total = planned_steps()
+        set_lr_factor(optimizers, lr_factor(step, total, args.warmup, "wsd"))
         out = model(x, text=text, text_pool=pool)
         out.loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -280,7 +307,8 @@ def main():
             opt.step()
             opt.zero_grad(set_to_none=True)
         with torch.no_grad():
-            decay = min(args.ema, (1 + step) / (10 + step))
+            # a fine-tuned EMA keeps its average from the start (its warmup would reset it to the raw weights)
+            decay = args.ema if fine_tune else min(args.ema, (1 + step) / (10 + step))
             for pe, pm in zip(ema.parameters(), model.parameters()):
                 pe.lerp_(pm, 1 - decay)
         seen_loss.append(out.denoise_loss.item())
@@ -317,7 +345,8 @@ def main():
             text, pool = encoder([captions_of(row)[0]])
             val.append((to_model_range(x), text, pool))
             continue
-        if args.limit_images and images_done + buffered >= args.limit_images:
+        if (args.limit_images and images_done + buffered >= args.limit_images) or (
+                args.minutes and time.time() - start >= args.minutes * 60):
             exhausted = False
             break
         bucket = buckets.setdefault(tuple(x.shape[-2:]), [])
@@ -336,7 +365,7 @@ def main():
         buffered -= len(batch)
         train_on(batch)
     report(final=True)
-    print(json.dumps(dict(stopped="byte budget or end of data" if exhausted else "image limit",
+    print(json.dumps(dict(stopped="byte budget or end of data" if exhausted else "image or time limit",
                           images=images_done, downloaded_gb=round(downloaded[0] / 1e9, 4))), flush=True)
     ema.save_pretrained(os.path.join(args.out, "ema"))
     model.save_pretrained(os.path.join(args.out, "raw"))

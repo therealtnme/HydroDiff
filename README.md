@@ -15,7 +15,7 @@ From the outside HydroDiff works like other generative pipelines:
 ```python
 from hydrodiff.pipeline_hydrodiff import HydroDiffPipeline, export_to_gif
 
-pipe = HydroDiffPipeline.from_pretrained("runs/coco/pipeline")
+pipe = HydroDiffPipeline.from_pretrained("runs/coco_ft/pipeline")
 image = pipe("a red double decker bus on a city street").images[0]           # text -> image
 image = pipe("the same street in winter", image=photo, strength=0.6).images[0] # text + image -> image
 frames = pipe("waves rolling onto a beach", num_frames=16).frames[0]          # text -> video (video models)
@@ -43,8 +43,10 @@ are on. The additions reuse those parts:
   are extra keys and values of every attention layer. Queries stay image tokens only, so the update mask still removes
   the whole cost of a finished token. Training swaps 10% of the prompts for a learned null prompt, which is the
   reference of classifier-free guidance (no extra text-encoder pass for the empty prompt).
-* **Any size, no crop.** Rotary positions follow the actual grid of each image, so one model trains and samples at many
-  sizes and aspect ratios. Training batches images of the same size together instead of cropping or padding.
+* **Any size, no crop (dynamic resolution).** Rotary positions follow the actual grid of each image, so one model
+  trains and samples at many sizes and aspect ratios. Training batches images of the same size together instead of
+  cropping or padding. With `time_shift_base_tokens` the noise schedule follows the size too: the shift grows with the
+  square root of the token count (SD3 / Flux), because at equal noise a larger image keeps more of its signal.
 * **Video** is a stack of frames with a third rotary axis for time (`modalities` containing `"video"`); an image is a
   one-frame video.
 * **Image conditioning needs no new parameters.** HydroDiff already treats tokens at noise level 0 as clean context that
@@ -58,15 +60,19 @@ are on. The additions reuse those parts:
 
 ```bash
 python test/train_stream.py --out runs/coco --text-encoder models/clip-vit-base-patch32-text --max-bytes 0.9e9 --save-pipeline
-python test/evaluate_text.py --pipeline runs/coco/pipeline --clip models/clip-vit-base-patch32 --n 32 --grid grid.png
+# fine-tune on the photos after those (each photo is still trained once), for a wall-clock budget
+python test/train_stream.py --out runs/coco_ft --init runs/coco/state.pt --text-encoder models/clip-vit-base-patch32-text     --minutes 180 --lr 6e-4 --muon-lr 6e-3 --set time_shift_base_tokens=300 --save-pipeline
+python test/evaluate_text.py --pipeline runs/coco_ft/pipeline --clip models/clip-vit-base-patch32 --n 32 --grid grid.png
 ```
 
 `train_stream.py` makes one pass (one epoch) over a Hugging Face parquet dataset streamed straight from the Hub. It
 reads one row group at a time with range requests, fetches only the image and caption columns, writes nothing to disk,
-and counts every byte it downloads; it stops before the row group that would pass `--max-bytes`. Images keep their full
+and counts every byte it streams; it stops at `--minutes`, `--limit-images`, or before the row group that would pass
+`--max-bytes`. `--init` fine-tunes a finished run on the rows after the ones it read; give it a lower learning rate (0.3x
+of the peak measured best; the full rate undid the first run's decay). Images keep their full
 frame (each side is scaled to the nearest multiple of 32 pixels). `evaluate_text.py` judges prompt following with a
 separate CLIP model: the CLIP score, and how often an image's own prompt ranks first (top-1) or in the top 5 of all
-prompts, against real photos and a flat mean-colour image as references.
+prompts, against real photos and a flat mean-colour image as references. Its test photos are streamed into memory too.
 
 ### What one epoch under 1 GB on a CPU gives
 
@@ -100,6 +106,30 @@ What was measured to get here (each kept only if it paid for itself, section 14)
 | fp16 weights on disk | half the storage (134 MB for the whole pipeline), images differ by 0.12 of an 8-bit level | default for saved pipelines |
 | Row-group streaming with range requests | about 2 GB peak memory instead of 3.2 GB and growing, and an exact count of downloaded bytes | default |
 | `hydrodiff-b`, bf16, 8 threads | 1.75x slower for 6%; 14x slower; no faster than 2-4 threads | dropped |
+
+### Fine-tuned on 13,091 more streamed photos
+
+Three more hours on the next 13,091 COCO photos (2.46 GB streamed, nothing stored; 18,041 different photos in all, each
+trained once), with dynamic resolution on ([`test/RESEARCH.md`](test/RESEARCH.md), section 15):
+
+| | Validation loss | Clean-image error at t = 0.9 | CLIP score | Prompt ranked first |
+| --- | --- | --- | --- | --- |
+| first run, 4,950 photos | 0.904 | 0.434 | 17.06 | 0.031 |
+| **fine-tuned, + 13,091 photos** | **0.638** | **0.364** | **18.31** | 0.031 (chance) |
+
+Every measure kept improving to the end of the run, so more photos are still the best lever. The prompt now sets the
+colour scheme clearly and the patches look like photo texture, but there are still no objects: the model is better,
+not yet useful.
+
+![Fine-tuned model, same prompts and seed as above](test/figures/coco_ft_samples.png)
+
+| Tried for the fine-tune | Effect at equal time | Status |
+| --- | --- | --- |
+| 0.3x learning rate, EMA continued | the full rate left the model worse than it started; 0.3x beat 0.1x and 1x | default for `--init` runs |
+| Dynamic resolution (`time_shift_base_tokens=300`) | free; level on CLIP at 320x256 and 1024x768 (model too weak to tell) | default for new models |
+| Masked training (50% of tokens, MaskDiT) | only 1.23x faster per photo, worse on every measure | dropped |
+| Batch 4 / 8 | 1.1x / 1.34x faster per photo, no better; worse at high noise | batch 2 kept |
+| REPA alignment to CLIP vision | about 4x the cost of a training step on this CPU | not run |
 
 ## Results
 

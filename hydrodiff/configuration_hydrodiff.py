@@ -1,3 +1,5 @@
+import math
+
 from huggingface_hub.dataclasses import strict
 
 from transformers.configuration_utils import PreTrainedConfig
@@ -54,6 +56,9 @@ class HydroDiffConfig(PreTrainedConfig):
         prediction_type (`str`): `"x"` (the network outputs the clean patch, the loss is on velocity) or `"v"`
             (the network outputs the velocity). Pixel patches are high-dimensional, which favours `"x"`.
         time_shift (`float`): Resolution shift of the noise schedule, `t' = s t / (1 + (s - 1) t)`.
+        time_shift_base_tokens (`int`): Dynamic resolution. When > 0 the shift follows the size of the image (tokens
+            per frame `n`): `s = time_shift * sqrt(n / time_shift_base_tokens)` (SD3: at equal noise a larger image keeps
+            more of its signal, since neighbouring pixels repeat each other, so it needs more noise). 0 = fixed shift.
         timestep_mean (`float`): Mean of the logit-normal training noise level (0: centred on t = 0.5; positive
             values train more at high noise, as MOSS-Image does).
         hetero_prob (`float`): Fraction of training images whose tokens get different noise levels.
@@ -118,6 +123,7 @@ class HydroDiffConfig(PreTrainedConfig):
 
     prediction_type: str = "x"
     time_shift: float | int = 1.0
+    time_shift_base_tokens: int = 0
     timestep_mean: float | int = 0.0
     hetero_prob: float | int = 0.25
     terminal_prob: float | int = 0.0
@@ -193,6 +199,12 @@ class HydroDiffConfig(PreTrainedConfig):
     @property
     def patch_dim(self) -> int:
         return self.num_channels * self.patch_size**2
+
+    def shift_for(self, tokens_per_frame: int) -> float:
+        """The noise-schedule shift of an image with this many tokens (fixed unless `time_shift_base_tokens` > 0)."""
+        if not self.time_shift_base_tokens:
+            return self.time_shift
+        return self.time_shift * math.sqrt(tokens_per_frame / self.time_shift_base_tokens)
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         return bool(self.num_experts) and layer_idx >= self.first_dense_layers

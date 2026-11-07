@@ -721,6 +721,74 @@ enough for a model that generates objects. The next levers, in order of expected
 
 ![One-step estimates of noised COCO test photos from the shift-1 run: real, then noisy and estimated at t = 0.3, 0.6, 0.9 and 1](figures/coco_denoise.png)
 
+## 15. More streamed photos: fine-tuning the one-epoch model
+
+Nothing is stored: photos are streamed into memory, trained on once and dropped, so the amount of data is limited only
+by training time. The question becomes what gives the most per CPU hour. Every run below fine-tunes the section-14
+model (`runs/coco/state.pt`) on the COCO rows after the ones it read, so each photo is still seen once (one epoch), and
+keeps its 32 held-out validation photos. `--init` loads the weights, EMA and optimizer moments; `--minutes` stops at a
+wall-clock budget. The A/B runs had 25 minutes each, two at a time on 2 threads.
+
+### Ideas from the literature
+
+| Idea | Source | Verdict |
+| --- | --- | --- |
+| Resolution-dependent shift (dynamic resolution) | SD3 (Esser et al. 2024), Flux's `mu` from the sequence length | implemented, on by default for new models (below) |
+| Masked training: train on a random half of the tokens | MaskDiT, "Stretching Each Dollar" (CVPR 2025) | measured, dropped |
+| Representation alignment to a frozen encoder (REPA) | REPA; PixelREPA (2026) finds plain REPA hurts pixel-space JiT models and needs an adapter | not run: the only local encoder (CLIP ViT-B/32 at the photo's own size) costs about 4x a training step of this 5M model, so it would have to make each photo worth 4x as much |
+| Contrastive flow matching, dispersive loss | section 13 | already measured, no gain |
+| Larger batch now that photos are unlimited | - | measured, kept batch 2 |
+
+### Fine-tuning learning rate, masking and batch size (equal time)
+
+| 25 min fine-tune | Photos | Val (EMA / raw) | t = 0.9 | t = 1 |
+| --- | --- | --- | --- | --- |
+| start (section 14 model) | - | 0.904 / 0.938 | 0.434 | 1.527 |
+| full learning rate (2e-3 / Muon 0.02), EMA warmup restarted | 1,576 | 0.948 / 0.970 | 0.430 | 1.495 |
+| same + 50% masked tokens | 1,930 | 0.994 / 0.969 | 0.436 | 1.505 |
+| **0.3x learning rate, EMA continued** | 1,484 | 0.909 / **0.901** | **0.419** | 1.507 |
+| 0.1x learning rate, EMA continued | 1,484 | 0.911 / 0.912 | 0.424 | 1.516 |
+| 0.3x, batch 4 | 1,668 | 0.906 / 0.898 | 0.424 | 1.513 |
+| 0.3x, batch 8 | 1,987 | 0.904 / 0.902 | 0.429 | 1.520 |
+
+* **Re-warming to the full learning rate undoes the decay** the first run ended with: 1,576 new photos left the model
+  worse than it started. 0.3x of the peak is the best of the three rates. The fine-tune EMA also has to keep decay 0.999
+  from its first step: its usual warmup would replace the averaged weights with the raw ones.
+* **Masking is dropped.** Half the tokens made a step only 1.23x faster (with about 300 tokens per photo, the text keys,
+  modulation and fixed per-step costs do not shrink), and it was worse on every measure even with 22% more photos.
+  Under the keep-only-if-it-pays rule the change was removed from the code.
+* **Batch size barely matters at equal time.** Batch 8 is 1.34x faster per photo but no better; batch 2 stays best at
+  high noise, where layout is made, so it stays the default.
+
+### Dynamic resolution
+
+`time_shift_base_tokens=300` scales the shift with the square root of the token count, `s = 3 sqrt(n / 300)`, in
+training and sampling (an explicit `time_shift` still overrides it). It costs nothing. On the section-14 model, CLIP
+scores with the matching shift were level with the fixed shift (1024x768: 17.08 against 17.32; 320x256: 17.03 against
+17.00, both within the noise of 32 prompts): the model is too weak for the score to show a difference. It is kept for
+the reason SD3 adopted it (at equal noise a larger image keeps more of its signal), and it is on in the model below.
+
+### Final fine-tune: 3 hours, 13,091 new photos
+
+`--init runs/coco/state.pt --minutes 180 --lr 6e-4 --muon-lr 6e-3 --set time_shift_base_tokens=300`, batch 2, 4 threads:
+6,586 steps, 1.2 photos per second, 2.46 GB streamed (nothing written to disk). With the first run, 18,041 different
+photos, each trained once.
+
+| Model | Val (EMA) | t = 0.9 | t = 1 | CLIP (guidance 3) | CLIP (no guidance) | Top-1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| section 14 (4,950 photos) | 0.904 | 0.434 | 1.527 | 17.06 | 17.66 | 0.031 |
+| **fine-tuned (+13,091 photos)** | **0.638** | **0.364** | **1.434** | **18.31** | **18.10** | 0.031 |
+
+Validation fell steadily for the whole run (0.910, 0.881, 0.838, 0.739, 0.666, 0.638 at 1,200 to 13,091 photos) and
+the high-noise error every time, so the model is still far from saturating: more photos remain the best lever.
+Guidance helps again (18.31 against 18.10). Prompts now set the colour scheme clearly (green fields, blue-grey snow,
+orange pizza) and the patches look like photo texture, but the images still have no objects, the patches do not join
+up, the CLIP score is still below a flat mean-colour image (19.23) and prompt ranking is at chance. Generation took
+3.1 s per 640x480 image at 16 steps with guidance, 1.9 s without (the same compute as before, 0.87 of a dense
+sampler; this machine was slower at the time than in section 14).
+
+![Fine-tuned model, same prompts and seed as the section-14 figure](figures/coco_ft_samples.png)
+
 ## Prior work
 
 The three ideas each have close relatives in recent work. The review (2022-2026) shaped the design:

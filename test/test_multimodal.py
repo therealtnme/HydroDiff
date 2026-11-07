@@ -263,3 +263,23 @@ def test_terminal_prob_trains_some_images_at_pure_noise():
     text, pool = prompts(4)
     out = model(torch.rand(4, 3, 16, 16) * 2 - 1, text=text, text_pool=pool)
     assert torch.isfinite(out.loss)
+
+
+def test_dynamic_resolution_shift_follows_image_size():
+    fixed = make(time_shift=3)
+    assert fixed.config.shift_for(4) == fixed.config.shift_for(400) == 3
+    model = make(time_shift=3, time_shift_base_tokens=16)
+    assert model.config.shift_for(16) == 3 and model.config.shift_for(64) == 6  # 4x the tokens: 2x the shift
+    # larger images train at higher noise (same draws, larger shift)
+    g = lambda: torch.Generator().manual_seed(0)  # noqa: E731
+    small = model.sample_timesteps(256, "cpu", generator=g(), num_tokens=16)
+    large = model.sample_timesteps(256, "cpu", generator=g(), num_tokens=16, tokens_per_frame=64)
+    assert (large >= small - 1e-6).all() and large.mean() > small.mean()
+    # sampling uses the shift of the size asked for; an explicit time_shift still overrides it
+    text, pool = prompts(1)
+    a = model.generate(text=text, text_pool=pool, height=32, width=32, steps=4, adaptive=False,
+                       generator=torch.Generator().manual_seed(0)).images
+    b = model.generate(text=text, text_pool=pool, height=32, width=32, steps=4, adaptive=False, time_shift=6,
+                       generator=torch.Generator().manual_seed(0)).images
+    assert torch.allclose(a, b)
+

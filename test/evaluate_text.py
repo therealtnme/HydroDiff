@@ -4,7 +4,8 @@ Measures how well a text-to-image HydroDiff pipeline follows its prompts, with a
     python test/evaluate_text.py --pipeline runs/coco/pipeline --clip models/clip-vit-base-patch32 --n 32
 
 For `--n` held-out captions (one per image of `--dataset`, generated at that image's own size) it reports
-(The evaluation photos come from the COCO test split, which training never reads, and are cached in `--cache`.)
+(The evaluation photos come from the COCO test split, which training never reads; they are streamed into memory each
+run, nothing is written to disk.)
 * clip_score: mean 100 * cosine(image, its prompt) (higher = closer to the prompt; real photos give the ceiling),
 * top1 / top5: how often the image's own prompt is the best (top 5) of all `--n` prompts (chance: 1/n, 5/n),
 * seconds per image and the sampler's compute (relative to a dense sampler with the same steps),
@@ -13,6 +14,7 @@ and writes a grid of the generated images (with the real photos for comparison) 
 """
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -41,22 +43,13 @@ def clip_scores(clip, processor, images, texts):
 
 
 def load_eval_set(args):
-    """`--n` held-out COCO test photos and their first captions, downloaded once into `--cache` (evaluation only)."""
-    index = os.path.join(args.cache, "captions.json")
-    if not os.path.exists(index):
-        os.makedirs(args.cache, exist_ok=True)
-        counter, texts = [0], []
-        for i, row in enumerate(stream(args.dataset, args.split, float("inf"), counter)):
-            if len(texts) >= args.skip + args.n:
-                break
-            if i < args.skip:
-                continue
-            with open(os.path.join(args.cache, f"{len(texts):04d}.jpg"), "wb") as f:
-                f.write(row["image"]["bytes"])
-            texts.append(captions_of(row)[0])
-        json.dump(texts, open(index, "w"))
-    texts = json.load(open(index))[: args.n]
-    reals = [Image.open(os.path.join(args.cache, f"{i:04d}.jpg")).convert("RGB") for i in range(len(texts))]
+    """`--n` held-out COCO test photos and their first captions, streamed into memory (nothing is stored)."""
+    reals, texts = [], []
+    for row in stream(args.dataset, args.split, float("inf"), [0], skip_rows=args.skip):
+        if len(texts) >= args.n:
+            break
+        reals.append(Image.open(io.BytesIO(row["image"]["bytes"])).convert("RGB"))
+        texts.append(captions_of(row)[0])
     return reals, texts
 
 
@@ -86,7 +79,7 @@ def main():
     ap.add_argument("--split", default="test")
     ap.add_argument("--skip", type=int, default=0)
     ap.add_argument("--n", type=int, default=32)
-    ap.add_argument("--cache", default="eval_coco_test", help="where the evaluation photos are kept")
+    ap.add_argument("--size", default=None, help="generate every image at WxH instead of its photo's size")
     ap.add_argument("--max-side", type=int, default=0, help="generate at most this long a side (0: native size)")
     ap.add_argument("--gen", nargs="*", default=[])
     ap.add_argument("--seed", type=int, default=0)
@@ -116,7 +109,7 @@ def main():
     images, compute, start = [], [], time.time()
     g = torch.Generator().manual_seed(args.seed)
     for real, text in zip(reals, texts):
-        w, h = real.size
+        w, h = map(int, args.size.split("x")) if args.size else real.size
         if args.max_side and max(w, h) > args.max_side:
             w, h = w * args.max_side // max(w, h), h * args.max_side // max(w, h)
         out = pipe(text, height=h, width=w, num_inference_steps=steps, generator=g, **gen)
